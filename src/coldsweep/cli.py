@@ -109,9 +109,10 @@ def init(
     typer.echo(f"created task {task!r} at {paths.root} from {source.name}")
     if created.budget_bounded:
         typer.secho("  every rule here is decided by an agent, so this task is budget-bounded: "
-                    "it will not converge.\n"
+                    "nothing in it forces the gate to close.\n"
                     f"  run it to max_rounds={created.convergence.max_rounds} and read "
-                    f"`coldsweep status --task {task}`.", fg=typer.colors.YELLOW)
+                    f"`coldsweep status --task {task}`. Converging is possible here, never "
+                    f"promised.", fg=typer.colors.YELLOW)
     typer.echo("  committed: profile.yaml, findings.jsonl, runs/    gitignored: index.sqlite")
     typer.echo(f"  edit {paths.profile} to state the task, then: coldsweep run --task {task}")
     siblings = [t for t in store.list_tasks(paths.repo) if t != task]
@@ -697,7 +698,7 @@ def run(
             spent = profile.budget_bounded
             colour = typer.colors.YELLOW if spent else typer.colors.RED
             headline = (f"budget spent: {len(rounds)} round(s) of max_rounds={ceiling}. This profile "
-                        f"has no deterministic decider, so it was never going to converge"
+                        f"has no deterministic decider, so nothing in it forced the gate to close"
                         if spent else
                         f"hard stop: {len(rounds)} round(s) reached max_rounds={ceiling} without converging")
             typer.secho(headline, fg=colour, err=True)
@@ -717,7 +718,16 @@ def run(
                 raise
         ingest(run_file=paths.run_file(n), task=task, repo=repo, force=False, no_llm=no_llm)
         if not no_fix:
-            fix(task=task, repo=repo, rule=None, limit=None)
+            try:
+                fix(task=task, repo=repo, rule=None, limit=None)
+            except typer.Exit as exc:
+                # A dead fix agent costs one round's work, never the budget. Whatever it failed
+                # to resolve is still open, the next round re-derives it from scratch, and the
+                # gate -- not the agent's exit code -- decides whether the task is done.
+                if not exc.exit_code:
+                    raise
+                typer.secho(f"round {n}: some fix agents failed; continuing, their findings stay "
+                            f"open for the next round", fg=typer.colors.YELLOW, err=True)
             verify_cmd(task=task, repo=repo)
 
 

@@ -406,11 +406,13 @@ class Profile(BaseModel):
 
     @property
     def budget_bounded(self) -> bool:
-        """True when no rule has a deterministic decider, so the gate will not close.
+        """True when no rule has a deterministic decider.
 
-        Open-ended agent rules plateau instead of converging: independent passes keep turning
-        up defensible observations neither of them found before. Such a profile is run to a
-        round budget and read, not driven to a gate.
+        Not a prediction that the gate stays shut: a profile whose agents find nothing goes
+        quiet and converges like any other. What it lacks is anything that *forces* the gate to
+        close. Open-ended agent rules were measured plateauing rather than decaying -- 44% of
+        findings appeared in exactly one pass of five -- so such a profile is run to a round
+        budget and read, rather than driven to a gate that may never open.
         """
         return bool(self.rules) and not any(r.decided_by == "code" for r in self.rules)
 

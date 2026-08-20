@@ -318,10 +318,14 @@ def test_valid_overrides_still_work(project: Path):
     assert coldsweep(project, "fix", "--limit", "1").returncode == 0
 
 
-def test_a_profile_with_no_deterministic_decider_says_it_will_not_converge(project: Path):
+def test_a_profile_with_no_deterministic_decider_says_nothing_forces_the_gate(project: Path):
+    """Budget-bounded is the absence of a guarantee, not a prediction: agents that find nothing
+    go quiet and converge like any other profile."""
     result = coldsweep(project, "init", "issues")
     assert result.returncode == 0
-    assert "budget-bounded" in result.stdout and "will not converge" in result.stdout
+    assert "budget-bounded" in result.stdout
+    assert "nothing in it forces the gate to close" in result.stdout
+    assert "never promised" in result.stdout
 
 
 def test_a_profile_with_a_deterministic_decider_makes_no_such_claim(project: Path):
@@ -330,11 +334,12 @@ def test_a_profile_with_a_deterministic_decider_makes_no_such_claim(project: Pat
 
 
 def test_spending_the_budget_is_reported_as_spent_not_as_failure(project: Path):
-    """A profile that was never going to converge must not report its ending as a hard stop."""
+    """A profile with nothing forcing the gate shut must not report its ending as a hard stop."""
     init(project, rules=[RULES[0]], convergence={"k": 2, "max_rounds": 1})
     result = coldsweep(project, "run", "--no-fix")
     assert result.returncode == 1, "the gate is still shut, and still says so"
-    assert "budget spent" in result.stderr and "never going to converge" in result.stderr
+    assert "budget spent" in result.stderr
+    assert "nothing in it forced the gate to close" in result.stderr
     assert "hard stop" not in result.stderr
 
 
