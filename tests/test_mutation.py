@@ -180,9 +180,13 @@ def test_a_vacuous_test_does_not_save_it(project: Path):
 
 
 def test_no_test_file_at_all_is_reported_without_running_anything(project: Path):
+    """One work item -- write the tests -- anchored at the file, and described as what it is.
+    "the suite passed with X changed" would be a false premise: no suite ran."""
     findings, report = run(project, profile(), project / "cache.sqlite")
     assert report.no_tests > 0 and report.killed == 0
-    assert [f.anchor for f in findings] == ["src/port.py::parse_port"]
+    assert [f.anchor for f in findings] == ["src/port.py"]
+    assert "No test file exists" in findings[0].description
+    assert "tests/test_port.py" in findings[0].description
 
 
 def test_one_finding_per_symbol_however_many_mutants_demonstrate_it(project: Path):
@@ -361,7 +365,7 @@ def test_the_sentinel_always_restores_the_source(project: Path):
 def test_files_without_paired_tests_never_reach_the_sentinel(project: Path):
     findings, report = run(project, profile(), project / "cache.sqlite")
     assert report.unexercised == [] and report.no_tests > 0
-    assert [f.anchor for f in findings] == ["src/port.py::parse_port"]
+    assert [f.anchor for f in findings] == ["src/port.py"]
 
 
 # --- interrupted runs -------------------------------------------------------

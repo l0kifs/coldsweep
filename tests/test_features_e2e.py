@@ -147,7 +147,7 @@ def test_implementing_the_item_closes_it(project: Path):
         coldsweep(project, "scan")
         coldsweep(project, "ingest", str(paths.run_file(n)))
     statuses = {f["rule_id"]: f["status"] for f in read_jsonl(paths.findings)}
-    assert statuses["unimplemented-spec-item"] == "verified"
+    assert statuses["unimplemented-spec-item"] == "lapsed"
     assert coldsweep(project, "converged").returncode == 0
 
 

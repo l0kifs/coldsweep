@@ -38,7 +38,7 @@ from .models import (
     Profile,
     RawFinding,
 )
-from .shard import paired_tests, resolve_scope
+from .shard import paired_tests, resolve_scope, test_paths
 
 BACKUP_SUFFIX = ".coldsweep-mutant-backup"
 SENTINEL = b'raise ImportError("coldsweep harness sentinel")\n'
@@ -298,6 +298,16 @@ class MutationCache:
         detail TEXT NOT NULL,
         PRIMARY KEY (mutant_id, source_sha, tests_sha, command_sha)
     );
+    CREATE TABLE IF NOT EXISTS probes (
+        kind TEXT NOT NULL,
+        source TEXT NOT NULL,
+        source_sha TEXT NOT NULL,
+        tests_sha TEXT NOT NULL,
+        command_sha TEXT NOT NULL,
+        ok INTEGER NOT NULL,
+        detail TEXT NOT NULL,
+        PRIMARY KEY (kind, source, source_sha, tests_sha, command_sha)
+    );
     """
 
     def __init__(self, path: Path) -> None:
@@ -312,6 +322,23 @@ class MutationCache:
         if row is None:
             return None
         return MutantResult(mutant_id=key[0], outcome=row[0], duration_s=row[1], detail=row[2])
+
+    def get_probe(self, kind: str, key: tuple[str, str, str, str]) -> tuple[bool, str] | None:
+        """A cached whole-suite verdict: the baseline run, or the import sentinel.
+
+        Neither judges a mutant, and both cost a full suite execution per source file per
+        round. Keyed by everything that could change the answer, so a round that changes
+        nothing pays for neither.
+        """
+        row = self.con.execute(
+            "SELECT ok, detail FROM probes WHERE kind=? AND source=? AND source_sha=? "
+            "AND tests_sha=? AND command_sha=?", (kind, *key)).fetchone()
+        return None if row is None else (bool(row[0]), row[1])
+
+    def put_probe(self, kind: str, key: tuple[str, str, str, str], ok: bool, detail: str) -> None:
+        self.con.execute("INSERT OR REPLACE INTO probes VALUES (?,?,?,?,?,?,?)",
+                         (kind, *key, int(ok), detail))
+        self.con.commit()
 
     def put(self, key: tuple[str, str, str, str], result: MutantResult) -> None:
         self.con.execute("INSERT OR REPLACE INTO results VALUES (?,?,?,?,?,?,?)",
@@ -404,34 +431,56 @@ class MutationRunner:
             return (-1, "timed out")
         return (proc.returncode, (proc.stdout + proc.stderr)[-400:])
 
-    def exercised_by_tests(self, shard: MutationShard) -> bool:
+    def shard_key(self, shard: MutationShard) -> tuple[str, str, str, str]:
+        """Everything that could change any verdict about this shard."""
+        return (shard.source,
+                hashlib.sha1((self.repo / shard.source).read_bytes()).hexdigest(),
+                sha_of([self.repo / t for t in shard.tests]),
+                self.command_sha)
+
+    def exercised_by_tests(self, shard: MutationShard, key: tuple[str, str, str, str],
+                           report: MutationReport) -> bool:
         """Whether the paired tests import the module at all.
 
         A sentinel, not a heuristic: the module is replaced by an import-time error and the
         tests are run. If they still pass, they never imported it, and every mutant that
         follows would "survive" for a reason that has nothing to do with test quality.
         """
+        cached = self.cache.get_probe("sentinel", key)
+        if cached is not None:
+            report.probes_cached += 1
+            return cached[0]
         path = self.repo / shard.source
         original = path.read_bytes()
         with self._swapped(path, original, SENTINEL):
             code, _ = self._run_tests(shard.tests, self.config.timeout_s)
+        self.cache.put_probe("sentinel", key, code != 0, "")
         return code != 0
 
-    def baseline(self, tests: list[str]) -> None:
+    def baseline(self, shard: MutationShard, key: tuple[str, str, str, str],
+                 report: MutationReport) -> None:
         """A red suite makes every verdict meaningless, so refuse to mutate against one."""
-        if not tests:
+        if not shard.tests:
             return
-        code, output = self._run_tests(tests, self.config.baseline_timeout_s)
-        if code != 0:
+        cached = self.cache.get_probe("baseline", key)
+        if cached is not None:
+            report.probes_cached += 1
+            ok, output = cached
+        else:
+            code, output = self._run_tests(shard.tests, self.config.baseline_timeout_s)
+            ok = code == 0
+            self.cache.put_probe("baseline", key, ok, "" if ok else output)
+        if not ok:
             raise MutationError(
                 "baseline test run failed; mutation results would be meaningless against a red "
-                f"suite. Fix the suite first.\n  tests: {' '.join(tests)}\n  output: {output.strip()}")
+                f"suite. Fix the suite first.\n  tests: {' '.join(shard.tests)}"
+                f"\n  output: {output.strip()}")
 
-    def run_shard(self, shard: MutationShard, report: MutationReport) -> Iterator[MutantResult]:
+    def run_shard(self, shard: MutationShard, key: tuple[str, str, str, str],
+                  report: MutationReport) -> Iterator[MutantResult]:
         path = self.repo / shard.source
         original = path.read_bytes()
-        source_sha = hashlib.sha1(original).hexdigest()
-        tests_sha = sha_of([self.repo / t for t in shard.tests])
+        _, source_sha, tests_sha, _ = key
         survivors_by_anchor: set[str] = set()
 
         for mutant in shard.mutants:
@@ -439,17 +488,17 @@ class MutationRunner:
                 report.skipped += 1
                 continue
 
-            key = (mutant.id, source_sha, tests_sha, self.command_sha)
-            result = self.cache.get(key)
+            mutant_key = (mutant.id, source_sha, tests_sha, self.command_sha)
+            result = self.cache.get(mutant_key)
             if result is not None:
                 report.cached += 1
             elif not shard.tests:
                 result = MutantResult(mutant_id=mutant.id, outcome="no_tests",
                                       detail=f"no test file matches {shard.source}")
-                self.cache.put(key, result)
+                self.cache.put(mutant_key, result)
             else:
                 result = self._judge(path, original, mutant, shard)
-                self.cache.put(key, result)
+                self.cache.put(mutant_key, result)
 
             report.mutants += 1
             if result.outcome == "survived":
@@ -501,16 +550,22 @@ def run(repo: Path, profile: Profile, cache_path: Path,
 
     by_mutant = {m.id: m for shard in shards for m in shard.mutants}
     survivors: dict[str, list[Mutant]] = {}
+    untested: set[str] = set()
     with_tests = [s for s in shards if s.tests]
     unexercised: list[str] = []
     try:
         for shard in shards:
-            runner.baseline(shard.tests)
-            if shard.tests and not runner.exercised_by_tests(shard):
+            key = runner.shard_key(shard)
+            runner.baseline(shard, key, report)
+            if shard.tests and not runner.exercised_by_tests(shard, key, report):
                 unexercised.append(shard.source)
                 continue
-            for result in runner.run_shard(shard, report):
-                if result.survived:
+            for result in runner.run_shard(shard, key, report):
+                # "no test file exists" and "the tests missed this mutation" are different work
+                # items. Describing the first as the second hands the fix agent a false premise.
+                if result.outcome == "no_tests":
+                    untested.add(shard.source)
+                elif result.outcome == "survived":
                     survivors.setdefault(by_mutant[result.mutant_id].anchor, []).append(
                         by_mutant[result.mutant_id])
     finally:
@@ -533,7 +588,21 @@ def run(repo: Path, profile: Profile, cache_path: Path,
     findings = [_finding(config, anchor, mutants) for anchor, mutants in sorted(survivors.items())]
     findings.extend(_unexercised_finding(config, shard) for shard in shards
                     if shard.source in report.unexercised)
+    findings.extend(_untested_finding(config, shard) for shard in shards
+                    if shard.source in untested)
     return findings, report
+
+
+def _untested_finding(config: MutationConfig, shard: MutationShard) -> RawFinding:
+    """One file, one work item: write the tests. Not one item per symbol nothing pins."""
+    return RawFinding(
+        rule_id=config.rule_id,
+        anchor=shard.source,
+        evidence=None,
+        description=(f"No test file exists for this module, so no mutation of it could be "
+                     f"judged at all. Expected one of: "
+                     f"{', '.join(test_paths(shard.source, config.test_patterns))}."),
+    )
 
 
 def _unexercised_finding(config: MutationConfig, shard: MutationShard) -> RawFinding:

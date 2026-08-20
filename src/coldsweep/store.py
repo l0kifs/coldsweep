@@ -13,11 +13,12 @@ from pathlib import Path
 import yaml
 from pydantic import ValidationError
 
-from .models import Finding, Profile, RunRecord, ScanRound
+from .models import Finding, Profile, Rule, RunRecord, ScanRound
 
 COLDSWEEP_DIR = ".coldsweep"
 TASKS_DIR = "tasks"
 TASK_NAME = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+_RULES_BLOCK = re.compile(r"^rules:[ \t]*$", re.MULTILINE)
 
 
 class StoreError(RuntimeError):
@@ -135,8 +136,64 @@ def load_profile(paths: Paths) -> Profile:
 
 
 def save_profile(paths: Paths, profile: Profile) -> None:
+    """Serialise the whole model over the file.
+
+    Every comment in the file is lost. profile.yaml is the committed statement of the task and
+    is written by hand, so nothing on the normal path may call this -- see ``append_rule`` for
+    editing the taxonomy.
+    """
     data = profile.model_dump(mode="json", exclude_defaults=False)
     atomic_write(paths.profile, yaml.safe_dump(data, sort_keys=False, allow_unicode=True))
+
+
+def _render_rule(rule: Rule) -> list[str]:
+    """One rule as YAML sequence-item lines, indented to match the templates."""
+    body = yaml.safe_dump(rule.model_dump(exclude_defaults=True), sort_keys=False,
+                          allow_unicode=True, width=100).splitlines()
+    return ["  - " + body[0]] + ["    " + line for line in body[1:]]
+
+
+def append_rule(paths: Paths, profile: Profile, rule: Rule) -> Profile:
+    """Add one rule to the taxonomy, leaving the rest of the file byte for byte as it was.
+
+    Re-serialising the model would be shorter and would delete every comment in a file whose
+    whole job is to explain the task to the next reader. So the rule is spliced into the
+    existing text instead, and the result is re-parsed and compared against what was intended
+    before anything is written. A splice that would change anything beyond the taxonomy is an
+    error naming the block to paste, never a silent rewrite.
+    """
+    text = paths.profile.read_text(encoding="utf-8")
+    block = _render_rule(rule)
+    manual = "\n".join(block)
+    match = _RULES_BLOCK.search(text)
+    if match is None:
+        raise StoreError(f"{paths.profile} has no block-style `rules:` section to extend; "
+                         f"add the rule by hand:\n{manual}")
+
+    lines = text.splitlines()
+    start = text[:match.start()].count("\n")
+    last = start
+    for i in range(start + 1, len(lines)):
+        stripped = lines[i].strip()
+        if stripped and not lines[i][0].isspace() and not stripped.startswith("#"):
+            break                       # the next top-level key ends the block
+        if stripped and not stripped.startswith("#"):
+            last = i                    # an indented, non-comment line is part of the block
+    candidate = "\n".join([*lines[:last + 1], *block, *lines[last + 1:]])
+    if text.endswith("\n"):
+        candidate += "\n"
+
+    try:
+        parsed = Profile.model_validate(yaml.safe_load(candidate) or {})
+    except (yaml.YAMLError, ValidationError) as exc:
+        raise StoreError(f"adding {rule.id!r} to {paths.profile} would not have produced a valid "
+                         f"profile; add it by hand:\n{manual}\n{exc}") from exc
+    if (parsed.rules != [*profile.rules, rule]
+            or parsed.model_dump(exclude={"rules"}) != profile.model_dump(exclude={"rules"})):
+        raise StoreError(f"adding {rule.id!r} to {paths.profile} would have changed more than the "
+                         f"taxonomy; add it by hand:\n{manual}")
+    atomic_write(paths.profile, candidate)
+    return parsed
 
 
 def load_findings(paths: Paths) -> list[Finding]:
@@ -192,6 +249,27 @@ def completed_rounds(paths: Paths) -> list[int]:
         if stem.isdigit():
             rounds.append(int(stem))
     return sorted(rounds)
+
+
+def incomplete_rounds(paths: Paths) -> list[int]:
+    """Completed rounds whose ingest did not cover every shard.
+
+    A round ingested with ``--force`` is still a round, but half a scan producing no new
+    findings is not evidence that there is nothing new to find, so it must not count toward the
+    quiet window. An ingest record that cannot be read is treated as incomplete for the same
+    reason: it cannot show coverage, and the gate errs shut.
+    """
+    out: list[int] = []
+    for round_no in completed_rounds(paths):
+        try:
+            record = RunRecord.model_validate_json(
+                paths.ingest_file(round_no).read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, ValidationError):
+            out.append(round_no)
+            continue
+        if record.failed_shards:
+            out.append(round_no)
+    return out
 
 
 def next_round(paths: Paths) -> int:

@@ -16,7 +16,7 @@ from . import converge, mechanical, merge, mutation, store, verify
 from . import spec as spec_mod
 from .models import Finding, Profile, RawFinding, Rule, ScanRound, Shard, ShardResult
 from .runner import AgentError, Runner
-from .shard import ShardError, build_shards, resolve_scope, shard_warnings
+from .shard import ShardError, build_shards, resolve_editable, shard_warnings
 from .store import Paths, StoreError
 
 TEMPLATE_DIR = Path(__file__).parent / "templates"
@@ -66,7 +66,8 @@ def _blockers(paths: Paths, profile: Profile) -> list[str]:
 
 
 def _evaluate(paths: Paths, profile: Profile, findings: list[Finding]) -> converge.ConvergenceReport:
-    return converge.evaluate(findings, profile, store.completed_rounds(paths), _blockers(paths, profile))
+    return converge.evaluate(findings, profile, store.completed_rounds(paths),
+                             _blockers(paths, profile), store.incomplete_rounds(paths))
 
 
 def _fail(message: str, code: int = 2) -> None:
@@ -136,10 +137,13 @@ def task_list(
         try:
             profile = store.load_profile(paths)
             findings = store.load_findings(paths)
-            report = converge.evaluate(findings, profile, store.completed_rounds(paths))
+            # The same evaluation `coldsweep converged` runs, blockers and coverage included. A
+            # listing that judged the gate by a cheaper rule would be the stale summary this
+            # tool exists to delete.
+            report = _evaluate(paths, profile, findings)
             rows.append({"task": name, "profile": profile.name, "rounds": len(report.completed_rounds),
                          "findings": len(findings), "converged": report.converged})
-        except StoreError as exc:
+        except (StoreError, spec_mod.SpecError) as exc:
             rows.append({"task": name, "error": str(exc).splitlines()[0]})
 
     if as_json:
@@ -194,7 +198,9 @@ def scan(
     for warning in shard_warnings(profile):
         typer.secho(f"warning: {warning}", fg=typer.colors.YELLOW, err=True)
 
-    survivors: list[RawFinding] = []
+    # Every deterministic subsystem appends to one list. Each is exhaustive over its own rules
+    # and blind to the others', so a profile that runs two of them must carry both results.
+    deterministic: list[RawFinding] = []
     try:
         if profile.spec is not None:
             drifted = _blockers(paths, profile)
@@ -203,13 +209,14 @@ def scan(
                     typer.secho(f"error: {reason}", fg=typer.colors.RED, err=True)
                 raise typer.Exit(2)
             traced, spec_report = spec_mod.run(paths.repo, profile, spec_mod.load_lock(paths.spec_lock))
-            survivors.extend(traced)
+            deterministic.extend(traced)
             typer.echo(f"round {n}: spec {spec_report.items} item(s) -- implemented "
                        f"{spec_report.implemented}, unimplemented {spec_report.unimplemented}, "
                        f"stale markers {spec_report.stale_markers}")
         if profile.mutation is not None:
             survivors, mutation_report = mutation.run(paths.repo, profile, paths.mutants,
                                                       paths.mutation_lock)
+            deterministic.extend(survivors)
             for source in mutation_report.unexercised:
                 typer.secho(f"round {n}: {source} is never imported by its paired tests",
                             fg=typer.colors.YELLOW, err=True)
@@ -217,7 +224,7 @@ def scan(
                        f"{mutation_report.shards} file(s) -- killed {mutation_report.killed}, "
                        f"survived {mutation_report.survived}, no tests {mutation_report.no_tests}, "
                        f"cached {mutation_report.cached}, {mutation_report.duration_s}s")
-        mech = _deterministic_shards(paths, profile, shards, n, survivors)
+        mech = _deterministic_shards(paths, profile, shards, n, deterministic)
     except (mechanical.MechanicalError, mutation.MutationError, spec_mod.SpecError) as exc:
         _fail(str(exc))
         return
@@ -376,7 +383,8 @@ def mutants(
     typer.echo(f"{report.mutants} mutant(s) over {report.shards} file(s) in {report.duration_s}s")
     typer.echo(f"  killed {report.killed}   survived {report.survived}   no tests {report.no_tests}"
                f"   errors {report.errors}")
-    typer.echo(f"  cache hits {report.cached}   skipped after first survivor {report.skipped}")
+    typer.echo(f"  cache hits {report.cached} mutant(s), {report.probes_cached} whole-suite run(s)"
+               f"   skipped after first survivor {report.skipped}")
     for source in report.unexercised:
         typer.secho(f"  {source}: never imported by its paired tests, so no mutant of it could "
                     f"ever be killed", fg=typer.colors.YELLOW)
@@ -451,7 +459,7 @@ def fix(
                f"with model {profile.models.fix}")
 
     by_id = {f.id: f for f in findings}
-    editable = resolve_scope(paths.repo, profile.scope) if profile.fix_scope == "task" else None
+    editable = resolve_editable(paths.repo, profile) if profile.fix_scope == "task" else None
     outcomes = asyncio.run(Runner(paths.repo, profile).fix(groups, editable))
     fixed = disputed = failed = 0
     for file, result in outcomes.items():
@@ -526,7 +534,7 @@ def status(
 
     typer.echo(f"profile: {profile.name}   rounds completed: {len(rounds)}   findings: {len(findings)}")
     typer.echo("\nby status")
-    for key in ("open", "fixed", "verified", "disputed", "wontfix"):
+    for key in ("open", "fixed", "verified", "lapsed", "disputed", "wontfix"):
         typer.echo(f"  {key:<10} {counts['status'].get(key, 0)}")
     typer.echo("\nby rule")
     for rule_id, count in sorted(counts["rule"].items()):
@@ -585,55 +593,74 @@ def adjudicate(
         typer.echo("nothing to adjudicate")
         return
 
+    profile, touched = _triage_unclassified(paths, profile, unclassified, n, wontfix_unclassified)
+    touched += _triage_disputes(disputes, n, accept_disputes)
+
+    store.save_findings(paths, findings)
+    store.rebuild_index(paths, profile, findings)
+    typer.echo(f"\nadjudicated {touched} finding(s)")
+
+
+def _triage_unclassified(paths: Paths, profile: Profile, unclassified: list[Finding], round_no: int,
+                         wontfix_all: bool) -> tuple[Profile, int]:
+    """Off-taxonomy findings: adopt the rule, retire the finding, or leave it in the bucket."""
     touched = 0
     for f in unclassified:
         typer.echo(f"\nunclassified  {f.id}\n  rule (off-taxonomy): {f.rule_id}\n  anchor: {f.anchor}\n"
                    f"  {f.description}")
-        choice = "w" if wontfix_unclassified else typer.prompt(
+        choice = "w" if wontfix_all else typer.prompt(
             "  [a]dd rule to taxonomy / [w]ontfix / [s]kip", default="s").strip().lower()[:1]
         if choice == "a":
             mode = typer.prompt("  mode [absence|presence]", default="absence").strip()
             description = typer.prompt("  rule description", default=f.description).strip()
             try:
-                profile.rules.append(Rule(id=f.rule_id, mode=mode, description=description))
+                rule = Rule(id=f.rule_id, mode=mode, description=description)
+                profile = store.append_rule(paths, profile, rule)
             except ValidationError:
                 typer.secho(f"  mode must be 'absence' or 'presence', got {mode!r}; skipped",
                             fg=typer.colors.RED, err=True)
                 continue
-            store.save_profile(paths, profile)
-            f.log(n, "classify", detail=f"rule {f.rule_id} added to taxonomy")
+            except StoreError as exc:
+                typer.secho(f"  {exc}", fg=typer.colors.RED, err=True)
+                continue
+            f.log(round_no, "classify", detail=f"rule {f.rule_id} added to taxonomy")
             touched += 1
         elif choice == "w":
             f.status = "wontfix"
             f.adjudicated = True
-            f.log(n, "wontfix", detail="unclassified, rejected in triage")
+            f.log(round_no, "wontfix", detail="unclassified, rejected in triage")
             touched += 1
+    return profile, touched
 
+
+def _triage_disputes(disputes: list[Finding], round_no: int, accept_all: bool) -> int:
+    """Fix-agent disputes: accept the objection, overrule it, or retire the finding."""
+    touched = 0
     for f in disputes:
         typer.echo(f"\ndisputed  {f.id}\n  rule: {f.rule_id}\n  anchor: {f.anchor}\n  {f.description}")
         for event in f.history[-3:]:
             typer.echo(f"    round {event.round} {event.action}: {event.detail}")
-        choice = "a" if accept_disputes else typer.prompt(
+        choice = "a" if accept_all else typer.prompt(
             "  [a]ccept dispute / [r]eopen / [w]ontfix / [s]kip", default="s").strip().lower()[:1]
         if choice == "a":
             f.adjudicated = True
-            f.log(n, "adjudicate", detail="dispute accepted in triage")
+            f.log(round_no, "adjudicate", detail="dispute accepted in triage")
             touched += 1
         elif choice == "r":
             f.status = "open"
             f.adjudicated = False
-            f.history = [e for e in f.history if e.action != "reopen"]
-            f.log(n, "adjudicate", detail="dispute rejected in triage; reopened and oscillation count reset")
+            # The trail keeps every reopen; the guard counts from here. Deleting the events
+            # would reset the same counter and lose the record of what actually happened.
+            f.reopen_baseline = f.reopens_logged
+            f.log(round_no, "adjudicate",
+                  detail="dispute rejected in triage; reopened and the oscillation count reset")
             touched += 1
         elif choice == "w":
             f.status = "wontfix"
             f.adjudicated = True
-            f.log(n, "wontfix", detail="dispute upheld in triage")
+            f.log(round_no, "wontfix", detail="dispute upheld in triage")
             touched += 1
-
-    store.save_findings(paths, findings)
-    store.rebuild_index(paths, profile, findings)
-    typer.echo(f"\nadjudicated {touched} finding(s)")
+    return touched
 
 
 @app.command()

@@ -6,9 +6,13 @@ import hashlib
 import re
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-Status = Literal["open", "fixed", "verified", "wontfix", "disputed"]
+Status = Literal["open", "fixed", "verified", "lapsed", "wontfix", "disputed"]
+"""``verified`` is proof: the repository was checked and the evidence is gone.
+``lapsed`` is silence: K independent scans stopped re-deriving the finding, which closes it
+but proves nothing. Collapsing the two would hide how much of a green run came from evidence
+and how much from nobody mentioning it again."""
 Mode = Literal["absence", "presence"]
 Source = Literal["agent", "mechanical"]
 MergeMethod = Literal["new", "exact", "fuzzy", "adjudicated", "mechanical", "stale", "reopen", "status"]
@@ -87,6 +91,13 @@ class Finding(BaseModel):
     adjudicated: bool = False
     first_seen_round: int = 0
     last_seen_round: int = 0
+    reopen_baseline: int = 0
+    """Reopens triage has already ruled on.
+
+    The oscillation guard counts from here rather than from zero. Deleting the reopen events
+    themselves would reset the same counter, at the cost of the record of what actually
+    happened -- and the audit trail is the one thing in a finding that is only ever appended to.
+    """
     history: list[Event] = Field(default_factory=list)
 
     @field_validator("anchor")
@@ -103,8 +114,14 @@ class Finding(BaseModel):
         return anchor_file(self.anchor)
 
     @property
-    def reopen_count(self) -> int:
+    def reopens_logged(self) -> int:
+        """Every reopen in the trail, including the ones triage has since forgiven."""
         return sum(1 for e in self.history if e.action == "reopen")
+
+    @property
+    def reopen_count(self) -> int:
+        """Reopens since the last triage reset -- what the oscillation guard counts."""
+        return self.reopens_logged - self.reopen_baseline
 
     def log(self, round_no: int, action: str, method: MergeMethod | None = None,
             score: float | None = None, detail: str = "") -> None:
@@ -203,7 +220,12 @@ class MergeStat(BaseModel):
 
 
 class RunRecord(BaseModel):
-    """Audit record of one ingest. Convergence never reads this -- it derives from findings.jsonl."""
+    """Audit record of one ingest.
+
+    Convergence derives from findings.jsonl and reads exactly one thing here: ``failed_shards``.
+    A shard that never reported leaves no trace in the finding set, so coverage is the one fact
+    about a round that cannot be recovered from the findings alone.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -337,6 +359,14 @@ class Profile(BaseModel):
     version: int = 1
     name: str = "default"
     scope: Scope = Field(default_factory=Scope)
+    editable: Scope | None = None
+    """Files a fix agent may write, when that is not the same set as the audited files.
+
+    Auditing a file and repairing it are the same act only for rules whose remedy lives where
+    the problem does. A rule about test quality is anchored in the source it fails to pin, and
+    fixed in a test file that `scope` deliberately excludes -- so with the two collapsed, the
+    fix agent is handed the one file it must not edit. Defaults to ``scope``.
+    """
     files_per_shard: int = Field(default=1, ge=1)
     convergence: Convergence = Field(default_factory=Convergence)
     models: Models = Field(default_factory=Models)
@@ -354,6 +384,16 @@ class Profile(BaseModel):
         if len(seen) != len(value):
             raise ValueError("duplicate rule ids in profile taxonomy")
         return value
+
+    @model_validator(mode="after")
+    def _editable_needs_task_scope(self) -> Profile:
+        """A per-file fix phase hands the agent the anchor's own file, which a separate editable
+        set is a statement that it must not edit. The two cannot both be meant."""
+        if self.editable is not None and self.fix_scope == "file":
+            raise ValueError("`editable` names a different set of files from `scope`, but "
+                             "`fix_scope: file` sends the fix agent to the anchor's own file; "
+                             "set `fix_scope: task`")
+        return self
 
     @property
     def rule_ids(self) -> set[str]:
@@ -514,6 +554,7 @@ class MutationReport(BaseModel):
     no_tests: int = 0
     errors: int = 0
     cached: int = 0
+    probes_cached: int = 0
     skipped: int = 0
     unexercised: list[str] = Field(default_factory=list)
     duration_s: float = 0.0

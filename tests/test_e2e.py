@@ -134,7 +134,8 @@ def test_the_full_loop_converges_and_opens_the_gate(project: Path):
 
     findings = read_jsonl(paths.findings)
     assert {f["rule_id"] for f in findings} == {"swallowed-exception", "undocumented-public-symbol"}
-    assert {f["status"] for f in findings} == {"verified"}
+    assert {f["rule_id"]: f["status"] for f in findings} == {
+        "swallowed-exception": "verified", "undocumented-public-symbol": "lapsed"}
     assert all(f["first_seen_round"] == 1 for f in findings)
 
     fixed = (project / "src" / "loader.py").read_text()
@@ -180,7 +181,7 @@ def test_a_regression_is_reopened_by_the_next_round(project: Path):
     assert coldsweep(project, "converged").returncode == 1
 
     assert coldsweep(project, "run").returncode == 0
-    assert {f["status"] for f in read_jsonl(paths.findings)} == {"verified"}
+    assert {f["status"] for f in read_jsonl(paths.findings)} == {"verified", "lapsed"}
     assert "pass" not in (project / "src" / "loader.py").read_text()
 
 

@@ -165,7 +165,7 @@ def test_findings_no_longer_re_derived_close_after_k_rounds(profile):
     findings, record = ingest(findings, make_round(2, ("s1", ["src/g.py"], [])), profile, 2)
     assert findings[0].status == "open" and record.stale_closed == 0, "one quiet round is not enough"
     findings, record = ingest(findings, make_round(3, ("s1", ["src/g.py"], [])), profile, 3)
-    assert findings[0].status == "verified" and record.stale_closed == 1
+    assert findings[0].status == "lapsed" and record.stale_closed == 1
 
 
 def test_a_failed_round_closes_nothing(profile):
@@ -269,14 +269,14 @@ def test_a_fixed_finding_that_stops_being_re_derived_also_closes(profile):
     findings, _ = ingest(findings, make_round(2, ("s1", ["src/g.py"], [])), profile, 2)
     assert findings[0].status == "fixed", "one quiet round is not enough"
     findings, record = ingest(findings, make_round(3, ("s1", ["src/g.py"], [])), profile, 3)
-    assert findings[0].status == "verified" and record.stale_closed == 1
+    assert findings[0].status == "lapsed" and record.stale_closed == 1
 
 
 def test_an_already_closed_finding_is_not_closed_again(profile):
     raw = {"rule_id": "swallowed-exception", "anchor": "src/g.py::send",
            "evidence": "except:\n    pass", "description": "Error discarded."}
     findings, _ = ingest([], make_round(1, ("s1", ["src/g.py"], [raw])), profile, 1)
-    findings[0].status = "verified"
+    findings[0].status = "lapsed"
     _, record = ingest(findings, make_round(4, ("s1", ["src/g.py"], [])), profile, 4)
     assert record.stale_closed == 0
 

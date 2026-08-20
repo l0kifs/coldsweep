@@ -55,7 +55,7 @@ def _touch(target: Finding, round_no: int, method: str, score: float | None, det
     target.last_seen_round = max(target.last_seen_round, round_no)
     target.log(round_no, "seen", method=method, score=score, detail=detail)  # type: ignore[arg-type]
 
-    if target.status in ("fixed", "verified"):
+    if target.status in ("fixed", "verified", "lapsed"):
         target.status = "open"
         target.log(round_no, "reopen", detail=f"re-derived in round {round_no} after {method} match")
         record.reopened += 1
@@ -166,6 +166,9 @@ def _close_stale(findings: list[Finding], profile: Profile, round_no: int, scan:
     A code decision, not a model one: K independent fresh-context scans failing to re-derive
     a finding is the same evidence convergence itself runs on. Without it an unreproducible
     finding blocks the gate forever.
+
+    Closed as ``lapsed``, never ``verified``: nothing here inspected the repository, so this is
+    silence rather than proof, and the two must stay countable apart.
     """
     if not scan.ok:
         return
@@ -176,7 +179,7 @@ def _close_stale(findings: list[Finding], profile: Profile, round_no: int, scan:
         if f.first_seen_round >= round_no:
             continue
         if round_no - f.last_seen_round >= k:
-            f.status = "verified"
+            f.status = "lapsed"
             f.log(round_no, "close", method="stale",
                   detail=f"not re-derived in {round_no - f.last_seen_round} consecutive rounds (k={k})")
             record.stale_closed += 1

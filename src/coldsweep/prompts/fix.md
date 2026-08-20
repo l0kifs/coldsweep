@@ -8,6 +8,8 @@ another full cycle.
 
 {{files}}
 
+{{new_files}}
+
 ## Rules referenced
 
 {{rules}}

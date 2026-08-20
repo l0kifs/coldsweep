@@ -83,22 +83,43 @@ def resolve_scope(repo: Path, scope: Scope) -> list[str]:
     return sorted(included)
 
 
+def resolve_editable(repo: Path, profile: Profile) -> list[str]:
+    """Files a fix agent may write. ``scope`` when the profile names no separate set."""
+    return resolve_scope(repo, profile.editable or profile.scope)
+
+
+def governed_files(repo: Path, profile: Profile) -> list[str]:
+    """Every file the task acts on at all -- audited, editable, or both.
+
+    Verification asks membership here rather than in ``scope``: a finding anchored in a file
+    the task may repair but does not audit is still one whose fix can be proved.
+    """
+    return sorted(set(resolve_scope(repo, profile.scope)) | set(resolve_editable(repo, profile)))
+
+
 def shard_id(files: list[str]) -> str:
     digest = hashlib.sha1("\n".join(sorted(files)).encode("utf-8")).hexdigest()[:8]
     return f"s-{digest}"
 
 
-def paired_tests(repo: Path, source: str, patterns: list[str]) -> list[str]:
-    """Tests responsible for one source file, by convention rather than by guesswork."""
-    stem = Path(source).stem
-    parent = Path(source).parent.name
+def test_paths(source: str, patterns: list[str]) -> list[str]:
+    """Where a source file's tests would live by convention. Existence is not checked.
+
+    Naming the paths a file has no tests at is how the finding says what to write.
+    """
+    path = Path(source)
     out: list[str] = []
     for pattern in patterns:
-        candidate = pattern.format(stem=stem, parent=parent,
-                                   path=Path(source).with_suffix("").as_posix())
-        if (repo / candidate).is_file() and candidate not in out:
+        candidate = pattern.format(stem=path.stem, parent=path.parent.name,
+                                   path=path.with_suffix("").as_posix())
+        if candidate not in out:
             out.append(candidate)
     return out
+
+
+def paired_tests(repo: Path, source: str, patterns: list[str]) -> list[str]:
+    """Tests responsible for one source file, by convention rather than by guesswork."""
+    return [c for c in test_paths(source, patterns) if (repo / c).is_file()]
 
 
 def build_shards(repo: Path, profile: Profile) -> list[Shard]:

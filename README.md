@@ -106,13 +106,35 @@ run.
 **Anchor** — a stable symbol path (`pkg/mod.py::Class::method`), never a line number, so it
 survives the edits the loop itself performs.
 
+**Scope vs editable** — `scope` is what gets audited; `editable` is what a fix agent may write.
+They are the same set by default, and must not be for a task whose remedies live elsewhere: a
+rule about test quality is anchored in the source it fails to pin and fixed in a test file, so
+the `tests` profile audits `src/**` and edits `tests/**` — the fix agent never touches the code
+under test. Verification reads the union, so a fix in an editable-but-unaudited file can still
+be proved. A separate `editable` set requires `fix_scope: task`; per-file fixing sends the agent
+to the anchor's own file, which is the file it was told not to edit.
+
 **Mode** — per rule, not per profile. `absence` verifies an offending snippet is gone;
 `presence` verifies a required artifact exists *and is non-vacuous*.
 
-**Convergence** — K consecutive rounds producing zero new findings, with nothing open, no
-untriaged dispute, and an empty unclassified bucket. Computed per task, over that task's rounds
-only. Taxonomy membership is derived from the profile on every read, never stored on a finding,
-so retiring a rule moves its findings straight back into the unclassified bucket.
+**Convergence** — K consecutive rounds of *full coverage* producing zero new findings, with
+nothing open, no untriaged dispute, and an empty unclassified bucket. Computed per task, over
+that task's rounds only. Taxonomy membership is derived from the profile on every read, never
+stored on a finding, so retiring a rule moves its findings straight back into the unclassified
+bucket. A round ingested with `--force` after a shard failed is still a round, but it never
+counts as quiet: half a scan reporting nothing new is not evidence that there is nothing new.
+
+**Closure** — `verified` is proof, `lapsed` is silence. `coldsweep verify` reads the file the
+anchor names and confirms the offending snippet is gone; that is `verified`. A finding that K
+consecutive scans simply stopped re-deriving is `lapsed` — closed, but nothing inspected the
+repository to close it. `coldsweep status` counts them separately, so a green run shows how
+much of its green came from evidence.
+
+Verification searches the anchor's file, not the whole repository. Repo-wide matching cannot
+tell a fix from an unrelated file that happens to contain the same snippet, so one surviving
+instance of a common idiom would reopen every finding under its rule. Code moved instead of
+fixed is caught by the next round re-deriving it at its new anchor. An anchor outside scope, or
+in a file that cannot be read, is deferred — never verified.
 
 **Shard** — a deterministic subset of scope handed to one agent invocation, resolved through
 `git ls-files`. One file per shard by default; enumeration exhaustiveness degrades sharply
@@ -170,6 +192,8 @@ version: 1
 scope:
   include: ["src/**/*.py"]
   exclude: ["**/migrations/**"]
+editable:                 # optional; defaults to scope. Requires fix_scope: task
+  include: ["tests/**/*.py"]
 files_per_shard: 1
 convergence:
   k: 2
@@ -368,10 +392,14 @@ state the tool exists to remove.
   [What converges and what doesn't](#what-converges-and-what-doesnt).
 - In `absence` mode a *partial* fix changes the evidence and therefore the id, so it surfaces
   as a new finding rather than a still-open one. Errs toward extra work, not silent loss.
+- A finding whose anchor names a file the profile neither audits nor may edit can never be
+  verified, only lapsed. Widen `editable` rather than accepting silence as proof.
 - Presence mode verifies non-vacuity by model judgement, except where a `mutation:` block
   gives it a deterministic predicate.
 - The mutation runtime is serial within a working tree. The cache, not parallelism, is what
-  makes repeat rounds cheap.
+  makes repeat rounds cheap: mutant verdicts, the baseline run and the import sentinel are all
+  keyed by the source, tests and command they were judged against, so an unchanged round runs
+  no test suite at all.
 - `stop_at_first_survivor` bounds cost by stopping once a symbol is known to be unpinned, so
   the reported survivor list is a sample rather than the full set. Turn it off for a complete
   enumeration.

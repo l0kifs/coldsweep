@@ -18,6 +18,7 @@ class ConvergenceReport(BaseModel):
     max_rounds: int
     completed_rounds: list[int] = Field(default_factory=list)
     quiet_rounds: int = 0
+    incomplete_rounds: list[int] = Field(default_factory=list)
     new_per_round: dict[str, int] = Field(default_factory=dict)
     open_ids: list[str] = Field(default_factory=list)
     disputed_pending_ids: list[str] = Field(default_factory=list)
@@ -61,20 +62,31 @@ def new_per_round(findings: list[Finding], rounds: list[int]) -> dict[int, int]:
 
 
 def evaluate(findings: list[Finding], profile: Profile, rounds: list[int],
-             extra_blockers: list[str] | None = None) -> ConvergenceReport:
-    """K consecutive rounds producing zero new findings, with nothing left open.
+             extra_blockers: list[str] | None = None,
+             incomplete: list[int] | None = None) -> ConvergenceReport:
+    """K consecutive rounds of *full* coverage producing zero new findings, nothing left open.
 
     ``extra_blockers`` carries reasons that do not live in the finding set at all -- an
     unfrozen or drifted spec is the only current example. They shut the gate and, unlike a
     dispute, they are not something triage can clear.
+
+    ``incomplete`` names rounds that were ingested without every shard reporting. Such a round
+    is quiet for a reason that has nothing to do with the repository being clean, so it cannot
+    count toward the window. Coverage is the one thing the gate reads outside the finding set,
+    because a missing shard leaves no trace in it.
     """
     k = profile.convergence.k
     rounds = sorted(rounds)
     counts = new_per_round(findings, rounds)
+    partial = {r for r in (incomplete or []) if r in counts}
     tail = rounds[-k:] if len(rounds) >= k else rounds
+
+    def is_quiet(r: int) -> bool:
+        return counts[r] == 0 and r not in partial
+
     quiet = 0
     for r in reversed(rounds):
-        if counts[r] == 0:
+        if is_quiet(r):
             quiet += 1
         else:
             break
@@ -82,14 +94,19 @@ def evaluate(findings: list[Finding], profile: Profile, rounds: list[int],
     op = open_blocking(findings, profile)
     dp = disputed_pending(findings)
     uc = unclassified_pending(findings, profile)
-    rounds_settled = len(rounds) >= k and not any(counts[r] for r in tail)
+    rounds_settled = len(rounds) >= k and all(is_quiet(r) for r in tail)
 
     reasons: list[str] = []
     if len(rounds) < k:
         reasons.append(f"only {len(rounds)} round(s) completed, need at least k={k}")
-    elif any(counts[r] for r in tail):
+    else:
         noisy = ", ".join(f"round {r}: +{counts[r]}" for r in tail if counts[r])
-        reasons.append(f"new findings inside the last {k} round(s) ({noisy})")
+        if noisy:
+            reasons.append(f"new findings inside the last {k} round(s) ({noisy})")
+        blind = ", ".join(str(r) for r in tail if r in partial)
+        if blind:
+            reasons.append(f"round(s) {blind} inside the last {k} were ingested with failed "
+                           f"shards; incomplete coverage cannot count as a quiet round")
     if op:
         reasons.append(f"{len(op)} finding(s) still open or awaiting verification")
     if dp:
@@ -110,6 +127,7 @@ def evaluate(findings: list[Finding], profile: Profile, rounds: list[int],
         max_rounds=profile.convergence.max_rounds,
         completed_rounds=rounds,
         quiet_rounds=quiet,
+        incomplete_rounds=sorted(partial),
         new_per_round={str(r): c for r, c in counts.items()},
         open_ids=sorted(f.id for f in op),
         disputed_pending_ids=sorted(f.id for f in dp),

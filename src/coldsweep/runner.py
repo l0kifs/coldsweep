@@ -203,6 +203,20 @@ class Runner:
                     for s in shards]
         return list(await asyncio.gather(*(self.scan_shard(s, phase) for s in shards)))
 
+    def _new_file_note(self) -> str:
+        """Whether the remedy may live in a file that does not exist yet, and where.
+
+        A rule whose fix is a missing artefact -- a test that was never written -- cannot be
+        resolved by editing existing files. A profile that separates its editable set from its
+        audited one is exactly the profile where that happens.
+        """
+        scope = self.profile.editable
+        if scope is None:
+            return "Do not create new files: edit only the files listed above."
+        patterns = ", ".join(f"`{p}`" for p in scope.include)
+        return ("A new file may be created when the remedy has nowhere else to live, provided "
+                f"its path matches one of: {patterns}.")
+
     async def fix_group(self, key: str, findings: list[Finding],
                         editable: list[str] | None = None) -> FixResult:
         listing = "\n".join(
@@ -213,7 +227,8 @@ class Runner:
         )
         files = editable if editable is not None else [key]
         prompt = render("fix.md", files="\n".join(f"- `{f}`" for f in files),
-                        rules=self._rules_block(), findings=listing)
+                        new_files=self._new_file_note(), rules=self._rules_block(),
+                        findings=listing)
         result, _ = await self.call(self.fix_phase(), prompt, FixResult)
         return result
 
