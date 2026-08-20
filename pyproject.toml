@@ -1,0 +1,61 @@
+[project]
+name = "coldsweep"
+version = "0.1.0"
+description = "Automates the fresh-context re-verification cycle for open-ended agent tasks"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pydantic>=2.9",
+    "typer>=0.12",
+    "rapidfuzz>=3.9",
+    "pyyaml>=6.0",
+]
+
+[project.scripts]
+coldsweep = "coldsweep.cli:main"
+coldsweep-stop-hook = "coldsweep.hooks.stop:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "ruff>=0.6",
+    "pylint>=3.2",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.0,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-root = "src"
+module-name = "coldsweep"
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "e2e: end-to-end tests driving the CLI against a scratch repo",
+]
+
+[tool.pylint.main]
+disable = [
+    "missing-module-docstring",
+    "missing-class-docstring",
+    "missing-function-docstring",
+    "too-few-public-methods",
+    "too-many-arguments",
+    "too-many-positional-arguments",
+    "too-many-locals",
+    "duplicate-code",
+]
+max-line-length = 120
+
+[tool.pylint.basic]
+# ast.NodeVisitor dispatches on method names that mirror AST node classes; they cannot be snake_case.
+method-rgx = "^(visit_[A-Z][A-Za-z]+|_{0,2}[a-z][a-z0-9_]*_{0,2})$"

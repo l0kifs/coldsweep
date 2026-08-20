@@ -1,0 +1,53 @@
+version: 1
+name: tests
+scope:
+  include: ["src/**/*.py"]
+  exclude: ["**/__init__.py", "**/migrations/**"]
+files_per_shard: 1
+convergence:
+  k: 2
+  max_rounds: 8
+models:
+  scan: sonnet
+  fix: sonnet
+  scan_alt: null
+  adjudicate: sonnet
+agent:
+  command: ["claude", "-p", "--output-format", "json"]
+  scan_tools: ["Read", "Grep", "Glob"]
+  fix_tools: ["Read", "Grep", "Glob", "Edit", "Write"]
+  permission_mode: acceptEdits
+  parallelism: 4
+  retries: 2
+  timeout_s: 900
+  extra_args: []
+  append_flags: true
+rules:
+  # Decided by the mutation subsystem, not by a model. Exhaustive over its scope.
+  - id: untested-behaviour
+    mode: presence
+    decided_by: code
+    description: >-
+      A symbol whose behaviour the test suite does not pin: the suite still passes when the
+      symbol's logic is changed.
+  # The tail the mutation engine cannot see, left to agents.
+  - id: vacuous-test
+    mode: absence
+    description: >-
+      A test that cannot fail: it asserts nothing, asserts a constant, or only asserts that a
+      call did not raise when the call's result is the thing under test.
+  - id: untested-error-path
+    mode: presence
+    description: >-
+      A documented or explicitly raised error condition has no test that exercises it. Missing
+      or wrong only -- never "could be tested more thoroughly".
+mechanical: []
+mutation:
+  rule_id: untested-behaviour
+  test_command: "python -m pytest -q -x {tests}"
+  test_patterns: ["tests/test_{stem}.py", "tests/{stem}_test.py"]
+  operators: ["comparison", "arithmetic", "boolean", "constant", "return"]
+  timeout_s: 120
+  baseline_timeout_s: 600
+  max_mutants_per_anchor: 12
+  stop_at_first_survivor: true

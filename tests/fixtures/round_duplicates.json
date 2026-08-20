@@ -1,0 +1,32 @@
+{
+  "round": 2,
+  "profile_version": 1,
+  "shards": [
+    {
+      "shard": "s-aaaa1111",
+      "files": ["src/loader.py"],
+      "ok": true,
+      "findings": [
+        {
+          "rule_id": "undocumented-public-symbol",
+          "anchor": "src/loader.py::Loader::load",
+          "evidence": null,
+          "description": "Loader.load has no docstring at all."
+        }
+      ]
+    },
+    {
+      "shard": "s-bbbb2222",
+      "files": ["src/writer.py"],
+      "ok": true,
+      "findings": [
+        {
+          "rule_id": "swallowed-exception",
+          "anchor": "src/writer.py::write_all",
+          "evidence": "try:\n    fh.write(payload)\nexcept Exception:\n    pass",
+          "description": "The write failure is discarded, so callers see success on a failed write."
+        }
+      ]
+    }
+  ]
+}

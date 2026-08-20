@@ -1,0 +1,52 @@
+version: 1
+name: features
+scope:
+  include: ["src/**/*.py"]
+  exclude: ["**/migrations/**"]
+files_per_shard: 1
+fix_scope: task
+convergence:
+  k: 2
+  max_rounds: 8
+models:
+  scan: sonnet
+  fix: sonnet
+  scan_alt: null
+  adjudicate: sonnet
+agent:
+  command: ["claude", "-p", "--output-format", "json"]
+  scan_tools: ["Read", "Grep", "Glob"]
+  fix_tools: ["Read", "Grep", "Glob", "Edit", "Write"]
+  permission_mode: acceptEdits
+  parallelism: 4
+  retries: 2
+  timeout_s: 900
+  extra_args: []
+  append_flags: true
+rules:
+  # Decided by code: an item with no marker anywhere in scope is unimplemented, full stop.
+  - id: unimplemented-spec-item
+    mode: presence
+    decided_by: code
+    description: >-
+      A frozen spec item that nothing in scope claims to implement. Resolved by implementing it
+      and marking the implementation with `# spec: <ID>`.
+  - id: stale-spec-reference
+    mode: absence
+    decided_by: code
+    description: >-
+      A `# spec: <ID>` marker naming an item that no longer exists in the spec, left behind by
+      a rename or a deletion.
+  # The tail: a marker is cheap to write, so whether it points at a real implementation is a
+  # judgement made against the frozen item text.
+  - id: vacuous-implementation
+    mode: presence
+    description: >-
+      A spec marker whose surrounding code does not actually deliver what the item states: a
+      stub, a TODO, a signature with no body, or a partial implementation missing a stated
+      behaviour. Missing or wrong only -- never "could be improved".
+mechanical: []
+spec:
+  path: SPEC.md
+  unimplemented_rule_id: unimplemented-spec-item
+  stale_reference_rule_id: stale-spec-reference

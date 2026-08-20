@@ -1,0 +1,31 @@
+{
+  "round": 1,
+  "profile_version": 1,
+  "shards": [
+    {
+      "shard": "s-cccc3333",
+      "files": ["src/gateway.py"],
+      "ok": true,
+      "findings": [
+        {
+          "rule_id": "missing-error-handling",
+          "anchor": "src/gateway.py::Gateway::send",
+          "evidence": "response = httpx.post(url, json=body)",
+          "description": "The HTTP call has no timeout and no error handling."
+        },
+        {
+          "rule_id": "swallowed-exception",
+          "anchor": "src/gateway.py::Gateway::send",
+          "evidence": "except httpx.HTTPError:\n    pass",
+          "description": "The transport error is discarded."
+        },
+        {
+          "rule_id": "missing-error-handling",
+          "anchor": "src/gateway.py::Gateway::send",
+          "evidence": "token = os.environ[\"API_TOKEN\"]",
+          "description": "A missing API_TOKEN raises KeyError instead of a usable error."
+        }
+      ]
+    }
+  ]
+}

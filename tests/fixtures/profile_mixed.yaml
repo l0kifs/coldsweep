@@ -1,0 +1,19 @@
+version: 1
+name: mixed
+scope:
+  include: ["src/**/*.py", "docs/**/*.md"]
+  exclude: ["**/migrations/**"]
+files_per_shard: 1
+convergence:
+  k: 2
+  max_rounds: 8
+rules:
+  - id: missing-error-handling
+    mode: absence
+    description: "An operation that can fail is performed with no handling of the failure."
+  - id: swallowed-exception
+    mode: absence
+    description: "An except block that discards the error."
+  - id: undocumented-public-symbol
+    mode: presence
+    description: "A public symbol has no substantive documentation entry."

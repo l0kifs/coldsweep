@@ -1,0 +1,56 @@
+# issues -- a BUDGET-BOUNDED profile.
+#
+# Every rule here is decided by an agent, and open-ended agent rules do not converge: measured
+# over five independent passes on unchanged code, 44% of findings appeared in exactly one pass
+# and the new-finding rate plateaued rather than reaching zero. The gate will stay shut.
+#
+# Set max_rounds to what you are willing to spend, run it, and read `coldsweep status`. A
+# non-zero exit from `coldsweep run` is the expected ending here, not a failure. Move a rule to
+# a deterministic check and mark it `decided_by: code` to bring it into the convergent half.
+version: 1
+name: issues
+scope:
+  include: ["src/**/*.py", "**/*.py"]
+  exclude: ["**/migrations/**", "tests/**", ".coldsweep/**"]
+files_per_shard: 1
+convergence:
+  k: 2
+  max_rounds: 8
+models:
+  scan: sonnet
+  fix: sonnet
+  scan_alt: null
+  adjudicate: sonnet
+agent:
+  command: ["claude", "-p", "--output-format", "json"]
+  scan_tools: ["Read", "Grep", "Glob"]
+  fix_tools: ["Read", "Grep", "Glob", "Edit", "Write"]
+  permission_mode: acceptEdits
+  parallelism: 4
+  retries: 2
+  timeout_s: 900
+  extra_args: []
+  append_flags: true
+rules:
+  - id: missing-error-handling
+    mode: absence
+    description: >-
+      An operation that can fail at runtime (I/O, network, subprocess, parsing, dict/index
+      access on external data) is performed with no handling of the failure, so the failure
+      surfaces as an unhandled exception or a wrong value.
+  - id: swallowed-exception
+    mode: absence
+    description: >-
+      An except block that discards the error: bare pass, a bare `except:`, or a return of a
+      default that hides the failure from the caller.
+  - id: unvalidated-external-input
+    mode: absence
+    description: >-
+      Data from outside the process (argv, env, HTTP, file, subprocess output) is used without
+      validating its type, range or presence.
+  - id: resource-leak
+    mode: absence
+    description: >-
+      A file, socket, subprocess or connection is opened without a context manager or a
+      guaranteed close on every path.
+mechanical: []

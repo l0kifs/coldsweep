@@ -1,0 +1,50 @@
+# docs -- a BUDGET-BOUNDED profile.
+#
+# Every rule here is decided by an agent, and open-ended agent rules do not converge: measured
+# over five independent passes on unchanged code, 44% of findings appeared in exactly one pass
+# and the new-finding rate plateaued rather than reaching zero. The gate will stay shut.
+#
+# Set max_rounds to what you are willing to spend, run it, and read `coldsweep status`. A
+# non-zero exit from `coldsweep run` is the expected ending here, not a failure. Move a rule to
+# a deterministic check and mark it `decided_by: code` to bring it into the convergent half.
+version: 1
+name: docs
+scope:
+  include: ["docs/**/*.md", "*.md"]
+  exclude: [".coldsweep/**", "CHANGELOG.md"]
+files_per_shard: 1
+convergence:
+  k: 2
+  max_rounds: 8
+models:
+  scan: sonnet
+  fix: sonnet
+  scan_alt: null
+  adjudicate: sonnet
+agent:
+  command: ["claude", "-p", "--output-format", "json"]
+  scan_tools: ["Read", "Grep", "Glob"]
+  fix_tools: ["Read", "Grep", "Glob", "Edit", "Write"]
+  permission_mode: acceptEdits
+  parallelism: 4
+  retries: 2
+  timeout_s: 900
+  extra_args: []
+  append_flags: true
+rules:
+  - id: undocumented-public-symbol
+    mode: presence
+    description: >-
+      A public symbol the document is responsible for describing has no entry, or has an entry
+      that only restates its name or signature without saying what it does or when to use it.
+  - id: missing-usage-example
+    mode: presence
+    description: >-
+      A documented capability has no runnable example, or has an example that is a placeholder
+      rather than a command or snippet the reader can actually run.
+  - id: stale-reference
+    mode: absence
+    description: >-
+      The document names a file, flag, command or symbol that does not exist in the repository
+      as written.
+mechanical: []
