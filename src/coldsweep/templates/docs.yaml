@@ -1,12 +1,16 @@
-# docs -- a BUDGET-BOUNDED profile.
+# docs -- a BUDGET-BOUNDED profile, but not a hopeless one.
 #
-# Every rule here is decided by an agent, and open-ended agent rules do not converge: measured
-# over five independent passes on unchanged code, 44% of findings appeared in exactly one pass
-# and the new-finding rate plateaued rather than reaching zero. The gate will stay shut.
+# Every rule here is decided by an agent, so nothing in this profile forces the gate to close.
+# It does not follow that it never closes: measured end to end on the coldsweep repository, the
+# new-finding rate decayed 8 -> 6 -> 2 -> 1 across four rounds rather than plateauing, because a
+# document is a closed target -- "this symbol has no entry" runs out of symbols in a way
+# "this code could fail here" does not. What held the gate shut at round 4 was 2 unadjudicated
+# disputes and 3 open findings, not a supply of new ones.
 #
-# Set max_rounds to what you are willing to spend, run it, and read `coldsweep status`. A
-# non-zero exit from `coldsweep run` is the expected ending here, not a failure. Move a rule to
-# a deterministic check and mark it `decided_by: code` to bring it into the convergent half.
+# So budget more rounds here than for `issues`, and expect `coldsweep adjudicate` to be what
+# actually finishes the task. A non-zero exit from `coldsweep run` is still the common ending.
+# Move a rule to a deterministic check and mark it `decided_by: code` to bring it into the
+# convergent half. Full numbers: docs/measurements.md.
 version: 1
 name: docs
 scope:

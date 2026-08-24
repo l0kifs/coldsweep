@@ -175,9 +175,10 @@ same set every pass, so their quiet window closes on the first repeat.
 
 In practice:
 
-- `issues` and `docs` are **budget-bounded**. Set `max_rounds` to what you are willing to
-  spend, run it, and read `coldsweep status`. A non-zero exit is the expected ending, not a
-  failure.
+- `issues` and `docs` are **budget-bounded** — neither has a deterministic decider. They do not
+  behave alike, though: measured end to end, `issues` plateaus (31, 22, 17, 15 new per round)
+  while `docs` decays (8, 6, 2, 1). Set `max_rounds` to what you are willing to spend, run it,
+  and read `coldsweep status`. A non-zero exit is the expected ending, not a failure.
 - `tests` and `features` converge on their deterministic half. The agent rules alongside them
   are still budget-bounded, so the gate reflects the decidable part.
 - `scan_alt` earns its cost: 57% of findings came from only one model family. Same-family
@@ -406,6 +407,12 @@ state the tool exists to remove.
 - A features task inherits its spec's incompleteness silently: the loop checks that every
   frozen item is implemented, never that the set of items is complete.
 - Cost scales as rounds x shards.
+
+## Measurements
+
+[docs/measurements.md](docs/measurements.md) records one real end-to-end `coldsweep run` per
+profile type against this repository — convergence curves, cost per round and per shard, where
+each profile's gate stuck, and everything needed to repeat the run.
 
 ## Tests
 
