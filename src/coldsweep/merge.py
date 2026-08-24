@@ -135,6 +135,7 @@ def _ingest_one(
                                               detail=f"absorbed {candidate.id}"))
             return
         if score >= ADJUDICATE_FLOOR and adjudicator is not None:
+            record.adjudicator_calls += 1
             same = bool(adjudicator(candidate, best))
             record.decisions.append(
                 MergeStat(method="adjudicated", finding_id=best.id if same else candidate.id, score=score,

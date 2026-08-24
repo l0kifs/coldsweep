@@ -439,9 +439,14 @@ def ingest(
     store.save_run_record(paths, record)
     store.rebuild_index(paths, profile, findings)
 
+    adjudication = f"adjudicated {record.adjudicated}"
+    if record.adjudicator_calls:
+        # A ruling of "different" merges nothing, so the merge count alone reads as though no
+        # adjudication happened -- while every call was still an agent subprocess.
+        adjudication += f" of {record.adjudicator_calls} call(s)"
     typer.echo(
         f"round {record.round}: ingested {record.ingested} -> new {record.new}, exact {record.exact}, "
-        f"fuzzy {record.fuzzy}, adjudicated {record.adjudicated}, reopened {record.reopened}, "
+        f"fuzzy {record.fuzzy}, {adjudication}, reopened {record.reopened}, "
         f"stale-closed {record.stale_closed}"
     )
     if record.unclassified:
@@ -826,6 +831,18 @@ def run(
                 typer.secho(f"round {n}: some fix agents failed; continuing, their findings stay "
                             f"open for the next round", fg=typer.colors.YELLOW, err=True)
             verify_cmd(task=task, repo=repo)
+        _report_round_spend(paths, n)
+
+
+def _report_round_spend(paths: Paths, round_no: int) -> None:
+    """What this round cost, printed as it ends -- the moment the next round is a choice."""
+    records = [r for r in store.load_spend(paths) if r.round == round_no]
+    total = converge.tally(records)
+    if not total.calls or total.unmeasured == total.calls:
+        return
+    phases = "  ".join(f"{phase} ${s.cost_usd:,.2f} ({s.calls})"
+                       for phase, s in converge.spend_by(records, "phase").items())
+    typer.echo(f"round {round_no}: cost ${total.cost_usd:,.2f} across {total.calls} call(s) -- {phases}")
 
 
 def _summary(paths: Paths) -> None:

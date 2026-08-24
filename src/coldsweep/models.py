@@ -291,6 +291,14 @@ class RunRecord(BaseModel):
     exact: int = 0
     fuzzy: int = 0
     adjudicated: int = 0
+    """Pairs the adjudicator ruled *the same*, and therefore merged."""
+    adjudicator_calls: int = 0
+    """Pairs sent to the adjudicator, however it ruled.
+
+    Separate from ``adjudicated`` because a ruling of "different" merges nothing and so moves
+    no counter, while still costing an LLM call. A round that spent 85 of them reported
+    ``adjudicated 0``, which reads as "adjudication did not happen".
+    """
     reopened: int = 0
     unclassified: int = 0
     disputed: int = 0

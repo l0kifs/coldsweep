@@ -314,13 +314,15 @@ enumeration quality — multiplies this floor directly.
 
 ## Defects this run surfaced
 
-Items 2, 3 and 4 are fixed; the rest stand.
+Items 1, 2, 3, 4 and 6 are fixed; 5, 7 and 8 stand.
 
-1. **`runner.py` discards the cost envelope.** `unwrap_envelope` returns only `result`.
-   Everything in this document had to be captured by wrapping the `claude` binary. Fix: keep
-   `usage`/`total_cost_usd`/`duration_ms` on `ShardResult`, aggregate into the round record,
-   report in `coldsweep status`. This is exactly what the `features` task implemented on
-   `bench/features` — that branch is a starting point, not a reviewed patch.
+1. ~~**`runner.py` discards the cost envelope.**~~ `unwrap_envelope` returned only `result`, so
+   everything in this document had to be captured by wrapping the `claude` binary. **Fixed** —
+   every agent subprocess is billed to a per-task `spend.jsonl`, one line per *attempt*, via the
+   single choke point `Runner.call`, so scan, fix and adjudicate are all covered. `coldsweep
+   status` reports total, per phase and per round; `coldsweep run` reports each round's cost as
+   it ends. An agent command that emits no envelope records `null`, never zero. Cross-checked
+   against an independent wrapper on the same binary: identical to the cent.
 2. ~~**`features.yaml` cannot verify its own deterministic findings.**~~ Every
    `unimplemented-spec-item` finding lapsed. The cause is one step earlier than scope, and
    widening scope would have changed nothing: `verify_findings` skips *every* `presence`
@@ -346,9 +348,13 @@ Items 2, 3 and 4 are fixed; the rest stand.
    `parallelism`-wide. On `tests` that is 108 agents, 4 at a time, each free to write any file
    under `tests/**` — two agents fixing two symbols of the same module write the same test file
    concurrently. Nothing serialises them.
-6. **LLM adjudication is an unreported cost centre.** 85 calls and $14.74 on `tests` round 1
+6. ~~**LLM adjudication is an unreported cost centre.**~~ 85 calls and $14.74 on `tests` round 1
    alone — 41% of its calls — because mutation and agent findings collide on the same symbols.
-   `coldsweep run` never mentions adjudication happened, let alone what it cost.
+   The round reported `adjudicated 0`, because that counter only ever counted pairs the
+   adjudicator ruled *the same*: a ruling of "different" merges nothing and moved no counter,
+   while still being a paid agent call. **Fixed** — `RunRecord.adjudicator_calls` counts every
+   invocation and ingest now prints `adjudicated 0 of 85 call(s)`, with the cost in the round's
+   spend line.
 7. **The dispute backlog is unbounded and blocks the gate.** `issues` ended with 24 disputed
    findings after 4 rounds, growing every round, with no automatic adjudication in `run`.
 8. **~40% of fixes do not survive verification** on `issues`, and the loop's only response is

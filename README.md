@@ -372,6 +372,18 @@ because a retry is another subprocess and another bill, and a phase that exhaust
 the most expensive outcome there is. Scan, fix and adjudicate all go through it; there is no
 unbilled path.
 
+`coldsweep run` prints each round's cost as the round ends, which is the moment buying another
+one is a choice:
+
+```
+round 3: ingested 19 -> new 17, exact 1, fuzzy 1, adjudicated 0 of 12 call(s), reopened 0, stale-closed 1
+round 3: cost $9.82 across 23 call(s) -- fix $3.50 (8)  scan $6.31 (15)
+```
+
+Adjudication is counted by calls made, not merges produced. A pair the adjudicator rules
+*different* merges nothing and moves no counter, but it was still an agent subprocess — a round
+that spent 85 of them used to report `adjudicated 0`.
+
 ```
 $ coldsweep status --task harden-io
 spend over 102 agent call(s)
