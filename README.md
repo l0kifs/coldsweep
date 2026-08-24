@@ -136,6 +136,11 @@ instance of a common idiom would reopen every finding under its rule. Code moved
 fixed is caught by the next round re-deriving it at its new anchor. An anchor outside scope, or
 in a file that cannot be read, is deferred — never verified.
 
+That path needs an offending snippet to look for, so it can only decide `absence` findings. A
+rule a deterministic subsystem owns does not need one: the sweep that produced the finding is
+exhaustive over scope, so re-running it *is* the check. `unimplemented-spec-item` is verified
+that way — the marker set is re-derived, and an item nothing marks reopens instead of lapsing.
+
 **Shard** — a deterministic subset of scope handed to one agent invocation, resolved through
 `git ls-files`. One file per shard by default; enumeration exhaustiveness degrades sharply
 above about five.

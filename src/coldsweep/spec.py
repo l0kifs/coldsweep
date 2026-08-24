@@ -165,6 +165,19 @@ def find_markers(repo: Path, profile: Profile) -> dict[str, list[tuple[str, str]
     return out
 
 
+def implemented_items(repo: Path, profile: Profile) -> set[str]:
+    """Ids of frozen items something in scope claims to implement, re-derived from the repository.
+
+    The marker sweep that produces `unimplemented-spec-item` findings is exhaustive over scope
+    and costs a regex pass, so repeating it is the honest way to check whether such a finding
+    was resolved. `verify` uses it for exactly that: a presence finding carries no offending
+    snippet to look for, so without this it can only ever be deferred.
+    """
+    if profile.spec is None:
+        return set()
+    return {item_id for item_id, sites in find_markers(repo, profile).items() if sites}
+
+
 def run(repo: Path, profile: Profile, lock: SpecLock | None) -> tuple[list[RawFinding], SpecReport]:
     """Deterministic half of a features task: which frozen items nothing claims to implement."""
     if profile.spec is None:
