@@ -147,6 +147,35 @@ def build_argv(cfg: AgentConfig, phase: Phase) -> list[str]:
     return argv
 
 
+def fix_lanes(groups: dict[str, list[Finding]],
+              targets: dict[str, list[str]]) -> list[list[str]]:
+    """Partition group keys into lanes that share no writable file.
+
+    Transitive by construction: two groups that never touch the same file still share a lane if
+    each shares one with a third. Union-find rather than a per-file lock so the whole schedule
+    is decided before any agent starts, and the result is deterministic for a given input.
+    """
+    parent = {key: key for key in groups}
+
+    def find(key: str) -> str:
+        while parent[key] != key:
+            parent[key] = parent[parent[key]]
+            key = parent[key]
+        return key
+
+    owner: dict[str, str] = {}
+    for key in sorted(groups):
+        for file in targets.get(key) or [key]:
+            root = find(key)
+            if file in owner:
+                parent[find(owner[file])] = root
+            owner[file] = key
+    lanes: dict[str, list[str]] = {}
+    for key in sorted(groups):
+        lanes.setdefault(find(key), []).append(key)
+    return [lanes[root] for root in sorted(lanes)]
+
+
 class Runner:
     """Owns every subprocess coldsweep spawns."""
 
@@ -266,19 +295,22 @@ class Runner:
                     for s in shards]
         return list(await asyncio.gather(*(self.scan_shard(s, phase) for s in shards)))
 
-    def _new_file_note(self) -> str:
+    def _new_file_note(self, files: list[str]) -> str:
         """Whether the remedy may live in a file that does not exist yet, and where.
 
         A rule whose fix is a missing artefact -- a test that was never written -- cannot be
         resolved by editing existing files. A profile that separates its editable set from its
         audited one is exactly the profile where that happens.
+
+        The permitted paths are this agent's own slice, never the profile's whole pattern list:
+        a note that widened the licence past the files above would put two agents back in the
+        same file, which is the collision the slice exists to prevent.
         """
-        scope = self.profile.editable
-        if scope is None:
+        if self.profile.editable is None:
             return "Do not create new files: edit only the files listed above."
-        patterns = ", ".join(f"`{p}`" for p in scope.include)
+        paths = ", ".join(f"`{f}`" for f in files)
         return ("A new file may be created when the remedy has nowhere else to live, provided "
-                f"its path matches one of: {patterns}.")
+                f"it is one of: {paths}.")
 
     async def fix_group(self, key: str, findings: list[Finding],
                         editable: list[str] | None = None) -> FixResult:
@@ -290,20 +322,34 @@ class Runner:
         )
         files = editable if editable is not None else [key]
         prompt = render("fix.md", files="\n".join(f"- `{f}`" for f in files),
-                        new_files=self._new_file_note(), rules=self._rules_block(),
+                        new_files=self._new_file_note(files), rules=self._rules_block(),
                         findings=listing)
         result, _, _ = await self.call(self.fix_phase(), prompt, FixResult)
         return result
 
     async def fix(self, groups: dict[str, list[Finding]],
-                  editable: list[str] | None = None) -> dict[str, FixResult | AgentError]:
-        keys = sorted(groups)
-        async def one(key: str) -> FixResult | AgentError:
-            try:
-                return await self.fix_group(key, groups[key], editable)
-            except AgentError as exc:
-                return exc
-        return dict(zip(keys, await asyncio.gather(*(one(k) for k in keys)), strict=True))
+                  slices: dict[str, list[str]] | None = None) -> dict[str, FixResult | AgentError]:
+        """Work every group, never letting two agents hold the same file at once.
+
+        ``slices`` says which files each group may write. Groups whose slices are disjoint can
+        run together; groups that share a file run one after another, because both would read
+        it, decide, and write it back whole, and the later write would erase the earlier one.
+        Without this the loss is silent: every agent reports ``fixed`` and the finding set
+        records work that is no longer in the tree.
+        """
+        targets = slices if slices is not None else {key: [key] for key in groups}
+
+        async def lane(keys: list[str]) -> dict[str, FixResult | AgentError]:
+            out: dict[str, FixResult | AgentError] = {}
+            for key in keys:
+                try:
+                    out[key] = await self.fix_group(key, groups[key], targets.get(key))
+                except AgentError as exc:
+                    out[key] = exc
+            return out
+
+        done = await asyncio.gather(*(lane(keys) for keys in fix_lanes(groups, targets)))
+        return {key: result for chunk in done for key, result in chunk.items()}
 
     async def adjudicate_pair(self, a: Finding, b: Finding) -> Adjudication:
         prompt = render(

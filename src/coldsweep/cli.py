@@ -27,8 +27,14 @@ from .models import (
     ShardResult,
     SpendRecord,
 )
-from .runner import AgentError, Runner
-from .shard import ShardError, build_shards, resolve_editable, shard_warnings
+from .runner import AgentError, Runner, fix_lanes
+from .shard import (
+    ShardError,
+    build_shards,
+    editable_slice,
+    resolve_editable,
+    shard_warnings,
+)
 from .store import Paths, StoreError
 
 TEMPLATE_DIR = Path(__file__).parent / "templates"
@@ -454,6 +460,19 @@ def ingest(
                     f"-- run `coldsweep adjudicate`", fg=typer.colors.YELLOW)
 
 
+def _editable_slices(paths: Paths, profile: Profile,
+                     groups: dict[str, list[Finding]]) -> dict[str, list[str]]:
+    """Which files each fix group may write, and therefore which groups can run together."""
+    editable = resolve_editable(paths.repo, profile)
+    slices = {key: editable_slice(profile, key, editable) for key in groups}
+    lanes = fix_lanes(groups, slices)
+    if len(lanes) < len(groups):
+        serialised = sum(len(lane) - 1 for lane in lanes if len(lane) > 1)
+        typer.echo(f"  {serialised} work item(s) share a file with another and run in sequence "
+                   f"({len(lanes)} lane(s))")
+    return slices
+
+
 def _unproven_sources(paths: Paths, profile: Profile,
                       outcomes: dict[str, FixResult | AgentError],
                       by_id: dict[str, Finding]) -> dict[str, str]:
@@ -542,8 +561,8 @@ def fix(
                f"with model {profile.models.fix}")
 
     by_id = {f.id: f for f in findings}
-    editable = resolve_editable(paths.repo, profile) if profile.fix_scope == "task" else None
-    outcomes = asyncio.run(_runner(paths, profile, n).fix(groups, editable))
+    slices = _editable_slices(paths, profile, groups) if profile.fix_scope == "task" else None
+    outcomes = asyncio.run(_runner(paths, profile, n).fix(groups, slices))
 
     rejected = _unproven_sources(paths, profile, outcomes, by_id)
     counts = _record_outcomes(outcomes, groups, by_id, rejected, n)

@@ -108,6 +108,10 @@ run.
 survives the edits the loop itself performs.
 
 **Scope vs editable** — `scope` is what gets audited; `editable` is what a fix agent may write.
+A fix agent is handed only the slice of that set its own work item needs — the profile's
+source-to-test pairing says where a fix belongs — and groups whose slices share a file run in
+sequence. Two agents that both read a file, decide, and write it back whole would leave only
+the later write, while both reported success.
 They are the same set by default, and must not be for a task whose remedies live elsewhere: a
 rule about test quality is anchored in the source it fails to pin and fixed in a test file, so
 the `tests` profile audits `src/**` and edits `tests/**` — the fix agent never touches the code

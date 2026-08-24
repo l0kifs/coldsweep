@@ -314,7 +314,7 @@ enumeration quality — multiplies this floor directly.
 
 ## Defects this run surfaced
 
-Items 1, 2, 3, 4 and 6 are fixed; 5, 7 and 8 stand.
+Items 1 through 6 are fixed; 7 and 8 stand.
 
 1. ~~**`runner.py` discards the cost envelope.**~~ `unwrap_envelope` returned only `result`, so
    everything in this document had to be captured by wrapping the `claude` binary. **Fixed** —
@@ -364,7 +364,17 @@ Items 1, 2, 3, 4 and 6 are fixed; 5, 7 and 8 stand.
 
    The fix-phase gate added for defect 4 does **not** cover this. It runs the paired tests and
    the surviving tests pass; a green suite cannot prove a test that was never written exists.
-   Still open.
+
+   **Fixed** — each group is now handed only the slice of the editable set its fix may write,
+   taken from the profile's own source-to-test pairing, and `fix_lanes` partitions the groups so
+   that any two sharing a file run in sequence while disjoint ones still run together. A profile
+   with no pairing gets the whole set back and is serialised, which is correct: an agent free to
+   write anywhere cannot safely run beside another. Same harness, `parallelism: 4`:
+
+   | Profile | Before | After |
+   |---|---|---|
+   | no pairing | 1 of 4 survive | 4 of 4, one lane |
+   | source-to-test pairing | 1 of 4 survive | 4 of 4, four lanes, full parallelism |
 6. ~~**LLM adjudication is an unreported cost centre.**~~ 85 calls and $14.74 on `tests` round 1
    alone — 41% of its calls — because mutation and agent findings collide on the same symbols.
    The round reported `adjudicated 0`, because that counter only ever counted pairs the
@@ -667,16 +677,23 @@ print(json.dumps({"type": "result", "subtype": "success", "is_error": False,
 
 `$BR/repro/race-profile.yaml` is the minimal profile with the shape the defect needs — audited
 and editable sets differing, `fix_scope: task`, `retries: 0`, no `mutation:` block so the run
-needs no pytest. The agent command is the stub with `append_flags: false`.
+needs no pytest. `race-profile-paired.yaml` adds `mutation.test_patterns` so each source has its
+own predictable test file; it is what shows that the repair preserves parallelism rather than
+just serialising everything. The agent command is the stub with `append_flags: false`.
 
 `$BR/repro/run.sh <parallelism>` builds a scratch git repo with four source files and one empty
 `tests/test_shared.py`, seeds `findings.jsonl` with four open findings on four distinct anchors,
 then runs `coldsweep fix` with `RACE_TARGET` pointing at the shared file:
 
 ```sh
-RACE_TARGET="$REPO/tests/test_shared.py" RACE_HOLD_S=0.4 coldsweep fix --task race -C "$REPO"
-grep -c '^def test_' "$REPO/tests/test_shared.py"     # 4 at parallelism 1, 1 at parallelism 4
+run.sh 4 race-profile          # no pairing:  one lane, 4 survive
+run.sh 4 race-profile-paired   # paired:      four lanes, 4 survive
+git stash push -- src/ && run.sh 4 race-profile   # pre-fix: 1 survives
 ```
+
+The stub writes to the first file the prompt lists under "Files you may edit", which is what a
+real agent does — and when every agent is handed the same list, every agent picks the same file.
+That is the whole defect in one line.
 
 Run `run.sh 1` first: it is the control, and all four tests must survive it. If they do not, the
 stub or the seed is wrong, not the tool.

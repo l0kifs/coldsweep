@@ -7,7 +7,7 @@ import re
 import subprocess
 from pathlib import Path
 
-from .models import Profile, Scope, Shard
+from .models import Profile, Scope, Shard, anchor_file
 
 MAX_RECOMMENDED_FILES_PER_SHARD = 5
 
@@ -86,6 +86,24 @@ def resolve_scope(repo: Path, scope: Scope) -> list[str]:
 def resolve_editable(repo: Path, profile: Profile) -> list[str]:
     """Files a fix agent may write. ``scope`` when the profile names no separate set."""
     return resolve_scope(repo, profile.editable or profile.scope)
+
+
+def editable_slice(profile: Profile, anchor: str, editable: list[str]) -> list[str]:
+    """The part of the editable set one work item's fix may write.
+
+    Handing every fix agent the whole editable tree is a licence it does not need and a race it
+    cannot see: under ``fix_scope: task`` the groups run in parallel, so two agents whose
+    remedies live in the same file hold that file at once and the second write erases the first.
+
+    A profile that pairs sources with tests already states where a fix belongs, so use that
+    pairing. The paths are taken by convention, not by existence -- a source with no test file
+    still has one predictable place to create it, and predicting it is what keeps two such
+    agents out of each other's way. A profile with no pairing gets the whole set back, and the
+    scheduler serialises those groups instead.
+    """
+    if profile.mutation is None:
+        return editable
+    return test_paths(anchor_file(anchor), profile.mutation.test_patterns) or editable
 
 
 def governed_files(repo: Path, profile: Profile) -> list[str]:
