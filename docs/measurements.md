@@ -343,11 +343,28 @@ Items 1, 2, 3, 4 and 6 are fixed; 5, 7 and 8 stand.
    a source whose tests fail keeps its findings `open`, logged as `fix-unproven`, and `coldsweep
    fix` reports the count. A source with no paired test file is not checked: nothing was claimed
    about a test that does not exist.
-5. **Concurrent fix agents share one editable set.** With `fix_scope: task`, `cli.py:fix`
-   groups by anchor and hands *every* group the same resolved `editable` list, then runs them
-   `parallelism`-wide. On `tests` that is 108 agents, 4 at a time, each free to write any file
-   under `tests/**` — two agents fixing two symbols of the same module write the same test file
-   concurrently. Nothing serialises them.
+5. **Concurrent fix agents share one editable set, and silently overwrite each other.** With
+   `fix_scope: task`, `cli.py:fix` groups by anchor and hands *every* group the same resolved
+   `editable` list, then runs them `parallelism`-wide. On `tests` that is 108 agents, 4 at a
+   time, each free to write any file under `tests/**`. Nothing serialises them.
+
+   **Reproduced** (harness below). Four findings on four different source symbols, one shared
+   remedy file, a stub fix agent doing the read-think-write a real agent does:
+
+   | `parallelism` | tests surviving in the file | findings marked `fixed` |
+   |---|---|---|
+   | 1 | 4 | 4 |
+   | 2 | **2** | 4 |
+   | 4 | **1** | 4 |
+
+   The loss scales with `parallelism`, and every run reports `fixed 4, disputed 0, failed
+   files 0`. The loop claims complete success while three quarters of the work is gone. It is
+   recoverable — the next round re-derives what was destroyed — but it costs a full round, and
+   in between the finding set says the work is done.
+
+   The fix-phase gate added for defect 4 does **not** cover this. It runs the paired tests and
+   the surviving tests pass; a green suite cannot prove a test that was never written exists.
+   Still open.
 6. ~~**LLM adjudication is an unreported cost centre.**~~ 85 calls and $14.74 on `tests` round 1
    alone — 41% of its calls — because mutation and agent findings collide on the same symbols.
    The round reported `adjudicated 0`, because that counter only ever counted pairs the
@@ -623,6 +640,46 @@ gives agent-seconds, which at `parallelism: 4` runs about 3.2× higher.
 
 The script and the raw logs live in `$BR`. The recovered aggregates from the first session are
 in `$BR/logs/recovered.json`.
+
+## Reproducing the concurrent-fix race (defect 5)
+
+Deterministic, no LLM calls. The stub holds the file for a fixed interval between read and
+write, so the outcome is repeatable rather than a coin flip; a real agent's Read-then-Write is
+the same race with a variable window, and Read-then-Edit is the same race with a narrower one.
+
+`$BR/repro/racy_fix_agent.py` — reads the rendered fix prompt on stdin, appends one test per
+finding to a shared target, reports `fixed`:
+
+```python
+prompt = sys.stdin.read()
+ids = re.findall(r"^- id: `([^`]+)`$", prompt, re.MULTILINE)
+
+body = TARGET.read_text() if TARGET.is_file() else ""     # read
+time.sleep(HOLD_S)                                        # decide
+for finding_id in ids:                                    # write back, whole file
+    body += f"def test_{finding_id.replace('-', '_')}():\n    assert True\n\n"
+TARGET.write_text(body)
+
+print(json.dumps({"type": "result", "subtype": "success", "is_error": False,
+                  "result": json.dumps({"results": [
+                      {"id": i, "outcome": "fixed", "detail": "..."} for i in ids]})}))
+```
+
+`$BR/repro/race-profile.yaml` is the minimal profile with the shape the defect needs — audited
+and editable sets differing, `fix_scope: task`, `retries: 0`, no `mutation:` block so the run
+needs no pytest. The agent command is the stub with `append_flags: false`.
+
+`$BR/repro/run.sh <parallelism>` builds a scratch git repo with four source files and one empty
+`tests/test_shared.py`, seeds `findings.jsonl` with four open findings on four distinct anchors,
+then runs `coldsweep fix` with `RACE_TARGET` pointing at the shared file:
+
+```sh
+RACE_TARGET="$REPO/tests/test_shared.py" RACE_HOLD_S=0.4 coldsweep fix --task race -C "$REPO"
+grep -c '^def test_' "$REPO/tests/test_shared.py"     # 4 at parallelism 1, 1 at parallelism 4
+```
+
+Run `run.sh 1` first: it is the control, and all four tests must survive it. If they do not, the
+stub or the seed is wrong, not the tool.
 
 ## Cleaning up
 
