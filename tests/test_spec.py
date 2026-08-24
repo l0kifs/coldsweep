@@ -304,9 +304,12 @@ def test_the_scan_context_is_empty_when_the_shard_claims_nothing(project: Path):
     assert spec_context(project, profile(), ["src/plain.py"]) == ""
 
 
-def test_the_scan_context_is_empty_when_the_spec_cannot_be_read(project: Path):
+def test_a_missing_spec_fails_the_shard_rather_than_scanning_without_its_task_statement(
+        project: Path):
+    """Returning "" here scanned a features shard with no spec and reported nothing missing."""
     (project / "SPEC.md").unlink()
-    assert spec_context(project, profile(), ["src/session.py"]) == ""
+    with pytest.raises(SpecError):
+        spec_context(project, profile(), ["src/session.py"])
 
 
 def test_only_python_files_get_symbol_anchors():

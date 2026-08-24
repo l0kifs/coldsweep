@@ -5,8 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from .models import Finding, Profile, evidence_sha, normalize_snippet
-from .shard import governed_files
-from .spec import implemented_items, symbol_text
+from .shard import ShardError, governed_files
+from .spec import SpecError, implemented_items, symbol_text
 
 
 def _read(repo: Path, rel: str) -> str | None:
@@ -56,6 +56,37 @@ def _spec_item_of(finding: Finding) -> str:
     return finding.anchor.split("::", 1)[-1].strip()
 
 
+def _governed_source(repo: Path, finding: Finding, governed: set[str] | None,
+                     cache: dict[str, str | None]) -> str | None:
+    """The finding's file, read once per pass, or ``None`` when it cannot be used as evidence.
+
+    One ``None`` for three cases the caller treats alike: scope unresolvable, file outside the
+    governed set, file unreadable. None of them is proof about the fix either way.
+    """
+    if governed is None or finding.file not in governed:
+        return None
+    if finding.file not in cache:
+        cache[finding.file] = _read(repo, finding.file)
+    return cache[finding.file]
+
+
+def _decide_spec_item(stats: dict[str, int], finding: Finding, round_no: int,
+                      implemented: set[str] | None) -> None:
+    """Decide one spec-item finding against the re-derived marker set.
+
+    ``implemented`` is ``None`` when the sweep could not run at all, which is not evidence that
+    the item is unmarked -- so the finding defers rather than reopening.
+    """
+    if implemented is None:
+        _defer(stats, finding, round_no, "scope could not be resolved through git")
+        return
+    item = _spec_item_of(finding)
+    if item in implemented:
+        _verified(stats, finding, round_no, f"{item} is marked by an implementation in scope")
+    else:
+        _reopen(stats, finding, round_no, f"nothing in scope carries a marker for {item}")
+
+
 def verify_findings(repo: Path, profile: Profile, findings: list[Finding], round_no: int) -> dict[str, int]:
     """Re-check every ``fixed`` finding against its evidence, in the file its anchor names.
 
@@ -85,30 +116,31 @@ def verify_findings(repo: Path, profile: Profile, findings: list[Finding], round
     candidates = [f for f in findings if f.status == "fixed"]
     if not candidates:
         return stats
-    governed = set(governed_files(repo, profile))
+    try:
+        governed: set[str] | None = set(governed_files(repo, profile))
+    except ShardError:
+        governed = None
     # Re-derived once for the whole pass, not per finding: the sweep is over all of scope.
     spec_rule = profile.spec.unimplemented_rule_id if profile.spec else None
-    implemented = implemented_items(repo, profile) if spec_rule else set()
+    implemented: set[str] | None = set()
+    if spec_rule:
+        try:
+            implemented = implemented_items(repo, profile)
+        except (ShardError, SpecError):
+            implemented = None
     sources: dict[str, str | None] = {}
     for f in candidates:
         if spec_rule and f.rule_id == spec_rule:
-            item = _spec_item_of(f)
-            if item in implemented:
-                _verified(stats, f, round_no, f"{item} is marked by an implementation in scope")
-            else:
-                _reopen(stats, f, round_no, f"nothing in scope carries a marker for {item}")
+            _decide_spec_item(stats, f, round_no, implemented)
             continue
         if not f.evidence or profile.mode_of(f.rule_id) != "absence":
             stats["deferred"] += 1
             continue
-        if f.file not in governed:
-            _defer(stats, f, round_no, f"{f.file} is outside the profile scope")
-            continue
-        if f.file not in sources:
-            sources[f.file] = _read(repo, f.file)
-        source = sources[f.file]
+        source = _governed_source(repo, f, governed, sources)
         if source is None:
-            _defer(stats, f, round_no, f"{f.file} could not be read")
+            _defer(stats, f, round_no,
+                   "scope could not be resolved through git" if governed is None
+                   else f"{f.file} is outside the profile scope, or could not be read")
             continue
         # The anchored symbol, not the whole file: the same idiom several times over in one
         # module would otherwise let an untouched copy reopen a finding about a fixed one.

@@ -392,7 +392,7 @@ enumeration quality — multiplies this floor directly.
 
 ## Defects this run surfaced
 
-All eight are fixed.
+All eight are fixed. Defect 9 was found afterwards, by reading run 2's output.
 
 1. ~~**`runner.py` discards the cost envelope.**~~ `unwrap_envelope` returned only `result`, so
    everything in this document had to be captured by wrapping the `claude` binary. **Fixed** —
@@ -494,6 +494,42 @@ All eight are fixed.
    reopens *and* a lower evidence-backed closure rate. Proving an additive remedy needs a
    predicate that asks whether the cited line is now guarded, which is rule-specific AST work
    and is not done here.
+
+### 9. Fix agents drift a contract apart within a single round
+
+Found by reviewing `bench2/issues` — 371 lines of error handling the `issues` task wrote into
+`src/` across four rounds. The code is good: raw `OSError` and `sqlite3.Error` turned into
+domain errors with context, `raise ... from exc` throughout, no silent fallbacks. Four of its
+guards are dead.
+
+`store.py`'s fix agent wrapped raw `OSError` and `sqlite3.Error` into `StoreError`. In the same
+round, `cli.py`'s agent wrote guards on the opposite premise, and stated it in a docstring:
+
+> atomic_write raises a raw OSError and rebuild_index a raw sqlite3.Error on failure — neither
+> is a StoreError, so both must be caught here rather than left to crash past every caller.
+
+True when that agent read the code. False by the time the round ended. `StoreError` is a
+`RuntimeError`, so three `except OSError` guards in `cli.py` and one in `runner.py` can no
+longer fire.
+
+Three are cosmetic — `main()` catches `StoreError` anyway, so the user sees a generic message
+instead of the intended one. The fourth is real: `Runner._record` guards the spend ledger
+specifically so a write failure cannot take down the rest of an `asyncio.gather` batch, and
+that is now exactly what it does.
+
+A second pair coordinated *correctly* by luck: `runner.py` removed the adjudicator's local
+`try/except` while `merge.py` added one around the call site. Complementary — but had only the
+first landed, any adjudicator failure would crash ingest.
+
+**Nothing detects this.** The 349-test suite passes; none of these paths is exercised. Every
+later round re-derives findings from the files alone, so a scan agent sees the drifted code as
+the new normal and has no reason to report it. And the cause is the design working as intended:
+fresh context per shard is what makes enumeration honest, and it is exactly why a per-file fix
+agent cannot see a contract it depends on changing next door.
+
+The error handling itself was worth having and has been ported to `main` with the four guards
+corrected. The defect is the class, not the instance: **a round's fix phase can leave the
+repository self-inconsistent in a way no later round will report.**
 
 ## Limits of this measurement
 

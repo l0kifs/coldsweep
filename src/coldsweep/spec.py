@@ -59,7 +59,10 @@ def parse_spec(text: str, config: SpecConfig) -> list[SpecItem]:
     An item runs from its own heading to the next one. Ids come from the document, never from
     the heading text, so an item keeps its identity when it is retitled.
     """
-    pattern = re.compile(config.item_pattern, re.MULTILINE)
+    try:
+        pattern = re.compile(config.item_pattern, re.MULTILINE)
+    except re.error as exc:
+        raise SpecError(f"{config.path}: invalid item_pattern {config.item_pattern!r}: {exc}") from exc
     matches = list(pattern.finditer(text))
     items: list[SpecItem] = []
     seen: set[str] = set()
@@ -84,7 +87,11 @@ def load_spec(repo: Path, config: SpecConfig) -> list[SpecItem]:
     path = repo / config.path
     if not path.is_file():
         raise SpecError(f"no spec at {config.path}; a features task needs one before it can run")
-    items = parse_spec(path.read_text(encoding="utf-8"), config)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise SpecError(f"{config.path}: cannot read spec: {exc}") from exc
+    items = parse_spec(text, config)
     if not items:
         raise SpecError(
             f"{config.path} contains no items matching the configured pattern.\n"
@@ -97,7 +104,11 @@ def load_lock(path: Path) -> SpecLock | None:
     if not path.is_file():
         return None
     try:
-        return SpecLock.model_validate_json(path.read_text(encoding="utf-8"))
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise SpecError(f"{path}: cannot read freeze record: {exc}") from exc
+    try:
+        return SpecLock.model_validate_json(text)
     except ValidationError as exc:
         raise SpecError(f"{path}: corrupt freeze record:\n{exc}") from exc
 
@@ -119,7 +130,7 @@ def symbol_ranges(source: str) -> list[tuple[int, int, str]]:
     """Line ranges of every function and class, innermost last, for anchoring a marker."""
     try:
         tree = ast.parse(source)
-    except SyntaxError:
+    except (SyntaxError, ValueError):
         return []
     ranges: list[tuple[int, int, str]] = []
 
@@ -166,15 +177,18 @@ def find_markers(repo: Path, profile: Profile) -> dict[str, list[tuple[str, str]
     """Every spec marker in scope, as ``item_id -> [(file, anchor)]``."""
     if profile.spec is None:
         return {}
-    pattern = re.compile(profile.spec.marker_pattern)
+    try:
+        pattern = re.compile(profile.spec.marker_pattern)
+    except re.error as exc:
+        raise SpecError(f"{profile.spec.path}: invalid marker_pattern {profile.spec.marker_pattern!r}: {exc}") from exc
     out: dict[str, list[tuple[str, str]]] = {}
     for rel in resolve_scope(repo, profile.scope):
         if rel == profile.spec.path:
             continue
         try:
             source = (repo / rel).read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
-            continue
+        except (OSError, UnicodeDecodeError) as exc:
+            raise SpecError(f"{rel}: cannot read while scanning for spec markers: {exc}") from exc
         for lineno, line in enumerate(source.splitlines(), start=1):
             match = pattern.search(line)
             if match:
@@ -244,10 +258,7 @@ def spec_context(repo: Path, profile: Profile, files: list[str]) -> str:
     """
     if profile.spec is None:
         return ""
-    try:
-        items = {item.id: item for item in load_spec(repo, profile.spec)}
-    except SpecError:
-        return ""
+    items = {item.id: item for item in load_spec(repo, profile.spec)}
     wanted = {item_id for item_id, sites in find_markers(repo, profile).items()
               if any(file in files for file, _ in sites)}
     relevant = [items[i] for i in sorted(wanted) if i in items]
@@ -268,9 +279,9 @@ def blockers(repo: Path, profile: Profile, lock_path: Path) -> list[str]:
         return []
     try:
         items = load_spec(repo, profile.spec)
+        lock = load_lock(lock_path)
     except SpecError as exc:
         return [str(exc).splitlines()[0]]
-    lock = load_lock(lock_path)
     if lock is None:
         return [f"{profile.spec.path} is not frozen; run `coldsweep spec freeze` before the loop can converge"]
     return [f"{reason} -- re-freeze deliberately with `coldsweep spec freeze`"

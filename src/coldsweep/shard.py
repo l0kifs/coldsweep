@@ -50,7 +50,10 @@ def _glob_to_regex(pattern: str) -> re.Pattern[str]:
             out.append(re.escape(ch))
             i += 1
     out.append(r")\Z")
-    return re.compile("".join(out))
+    try:
+        return re.compile("".join(out))
+    except re.error as exc:
+        raise ShardError(f"invalid scope glob pattern {pattern!r}: {exc}") from exc
 
 
 def matches_any(path: str, patterns: list[str]) -> bool:
@@ -66,6 +69,8 @@ def git_files(repo: Path) -> list[str]:
         )
     except FileNotFoundError as exc:
         raise ShardError("git is not on PATH; coldsweep resolves scope through git ls-files") from exc
+    except UnicodeDecodeError as exc:
+        raise ShardError(f"git ls-files output in {repo} is not valid text: {exc}") from exc
     except subprocess.CalledProcessError as exc:
         raise ShardError(f"git ls-files failed in {repo}: {exc.stderr.strip()}") from exc
     seen: dict[str, None] = {}
@@ -128,8 +133,11 @@ def test_paths(source: str, patterns: list[str]) -> list[str]:
     path = Path(source)
     out: list[str] = []
     for pattern in patterns:
-        candidate = pattern.format(stem=path.stem, parent=path.parent.name,
-                                   path=path.with_suffix("").as_posix())
+        try:
+            candidate = pattern.format(stem=path.stem, parent=path.parent.name,
+                                       path=path.with_suffix("").as_posix())
+        except (KeyError, IndexError, ValueError, AttributeError) as exc:
+            raise ShardError(f"invalid test pattern {pattern!r}: {exc}") from exc
         if candidate not in out:
             out.append(candidate)
     return out
@@ -137,7 +145,14 @@ def test_paths(source: str, patterns: list[str]) -> list[str]:
 
 def paired_tests(repo: Path, source: str, patterns: list[str]) -> list[str]:
     """Tests responsible for one source file, by convention rather than by guesswork."""
-    return [c for c in test_paths(source, patterns) if (repo / c).is_file()]
+    out = []
+    for c in test_paths(source, patterns):
+        try:
+            if (repo / c).is_file():
+                out.append(c)
+        except OSError:
+            continue
+    return out
 
 
 def build_shards(repo: Path, profile: Profile) -> list[Shard]:

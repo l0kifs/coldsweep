@@ -136,10 +136,18 @@ def _ingest_one(
             return
         if score >= ADJUDICATE_FLOOR and adjudicator is not None:
             record.adjudicator_calls += 1
-            same = bool(adjudicator(candidate, best))
+            try:
+                same = bool(adjudicator(candidate, best))
+            except Exception as exc:  # pylint: disable=broad-exception-caught
+                # Adjudicator failure is ambiguity, not certainty either way -- and every
+                # ambiguous case resolves toward *not* merging, same as a "different" ruling.
+                same = False
+                detail = f"adjudicator error, treated as different from {best.id}: {exc}"
+            else:
+                detail = f"{'same' if same else 'different'} as {candidate.id}"
             record.decisions.append(
                 MergeStat(method="adjudicated", finding_id=best.id if same else candidate.id, score=score,
-                          detail=f"{'same' if same else 'different'} as {candidate.id}")
+                          detail=detail)
             )
             if same:
                 claimed.add(best.id)
@@ -147,8 +155,7 @@ def _ingest_one(
                 best.log(round_no, "merge", method="adjudicated", score=score, detail=f"absorbed {candidate.id}")
                 record.adjudicated += 1
                 return
-            candidate.log(round_no, "adjudicated", method="adjudicated", score=score,
-                          detail=f"ruled different from {best.id}")
+            candidate.log(round_no, "adjudicated", method="adjudicated", score=score, detail=detail)
 
     # 4. New finding. Also the resting place of the 0.75-0.92 band when no adjudicator is
     #    wired up: an unresolved maybe becomes a duplicate, never a merge.

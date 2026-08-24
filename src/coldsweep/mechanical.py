@@ -51,6 +51,10 @@ def run_check(repo: Path, check: MechanicalCheck, files: list[str], timeout_s: i
                                   timeout=timeout_s, check=False)
         except subprocess.TimeoutExpired as exc:
             raise MechanicalError(f"mechanical check for {check.rule_id!r} timed out after {timeout_s}s") from exc
+        except OSError as exc:
+            raise MechanicalError(f"mechanical check for {check.rule_id!r} failed to launch: {exc}") from exc
+        except UnicodeDecodeError as exc:
+            raise MechanicalError(f"mechanical check for {check.rule_id!r} produced non-UTF8 output: {exc}") from exc
         stdout = proc.stdout.strip()
         if not stdout:
             if proc.returncode != 0:

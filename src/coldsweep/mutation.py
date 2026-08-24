@@ -20,6 +20,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import os
+import shlex
 import shutil
 import sqlite3
 import subprocess
@@ -65,10 +66,13 @@ def invalidate_bytecode(path: Path) -> None:
     """
     stem = path.stem
     cache = path.parent / "__pycache__"
-    if cache.is_dir():
-        for entry in cache.glob(f"{stem}.*.pyc"):
-            entry.unlink(missing_ok=True)
-    path.with_suffix(".pyc").unlink(missing_ok=True)
+    try:
+        if cache.is_dir():
+            for entry in cache.glob(f"{stem}.*.pyc"):
+                entry.unlink(missing_ok=True)
+        path.with_suffix(".pyc").unlink(missing_ok=True)
+    except OSError as exc:
+        raise MutationError(f"{path}: cannot invalidate bytecode cache: {exc}") from exc
 
 
 def _line_starts(source: bytes) -> list[int]:
@@ -256,7 +260,11 @@ def sha_of(paths: list[Path]) -> str:
     digest = hashlib.sha1()
     for path in sorted(paths):
         digest.update(str(path).encode("utf-8"))
-        digest.update(path.read_bytes() if path.is_file() else b"<missing>")
+        try:
+            content = path.read_bytes() if path.is_file() else b"<missing>"
+        except OSError as exc:
+            raise MutationError(f"{path}: cannot read for mutation: {exc}") from exc
+        digest.update(content)
     return digest.hexdigest()
 
 
@@ -311,14 +319,24 @@ class MutationCache:
     """
 
     def __init__(self, path: Path) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self.con = sqlite3.connect(path)
-        self.con.executescript(self.SCHEMA)
+        con = None
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            con = sqlite3.connect(path)
+            con.executescript(self.SCHEMA)
+        except (OSError, sqlite3.Error) as exc:
+            if con is not None:
+                con.close()
+            raise MutationError(f"{path}: cannot open mutation cache: {exc}") from exc
+        self.con = con
 
     def get(self, key: tuple[str, str, str, str]) -> MutantResult | None:
-        row = self.con.execute(
-            "SELECT outcome, duration_s, detail FROM results "
-            "WHERE mutant_id=? AND source_sha=? AND tests_sha=? AND command_sha=?", key).fetchone()
+        try:
+            row = self.con.execute(
+                "SELECT outcome, duration_s, detail FROM results "
+                "WHERE mutant_id=? AND source_sha=? AND tests_sha=? AND command_sha=?", key).fetchone()
+        except sqlite3.Error as exc:
+            raise MutationError(f"cannot read mutation result from cache: {exc}") from exc
         if row is None:
             return None
         return MutantResult(mutant_id=key[0], outcome=row[0], duration_s=row[1], detail=row[2])
@@ -330,9 +348,12 @@ class MutationCache:
         round. Keyed by everything that could change the answer, so a round that changes
         nothing pays for neither.
         """
-        row = self.con.execute(
-            "SELECT ok, detail FROM probes WHERE kind=? AND source=? AND source_sha=? "
-            "AND tests_sha=? AND command_sha=?", (kind, *key)).fetchone()
+        try:
+            row = self.con.execute(
+                "SELECT ok, detail FROM probes WHERE kind=? AND source=? AND source_sha=? "
+                "AND tests_sha=? AND command_sha=?", (kind, *key)).fetchone()
+        except sqlite3.Error as exc:
+            raise MutationError(f"cannot read mutation probe from cache: {exc}") from exc
         return None if row is None else (bool(row[0]), row[1])
 
     def put_probe(self, kind: str, key: tuple[str, str, str, str], ok: bool, detail: str) -> None:
@@ -341,9 +362,12 @@ class MutationCache:
         self.con.commit()
 
     def put(self, key: tuple[str, str, str, str], result: MutantResult) -> None:
-        self.con.execute("INSERT OR REPLACE INTO results VALUES (?,?,?,?,?,?,?)",
-                         (*key, result.outcome, result.duration_s, result.detail))
-        self.con.commit()
+        try:
+            self.con.execute("INSERT OR REPLACE INTO results VALUES (?,?,?,?,?,?,?)",
+                             (*key, result.outcome, result.duration_s, result.detail))
+            self.con.commit()
+        except sqlite3.Error as exc:
+            raise MutationError(f"cannot write mutation result to cache: {exc}") from exc
 
     def close(self) -> None:
         self.con.close()
@@ -352,7 +376,7 @@ class MutationCache:
 def run_tests(repo: Path, config: MutationConfig, tests: list[str],
               timeout_s: int) -> tuple[int, str]:
     """Run the configured test command over `tests`. Returns (exit code, tail of the output)."""
-    command = config.test_command.replace("{tests}", " ".join(tests))
+    command = config.test_command.replace("{tests}", " ".join(shlex.quote(t) for t in tests))
     # Never let a run leave bytecode behind for the next one to import.
     env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
     try:
@@ -360,6 +384,8 @@ def run_tests(repo: Path, config: MutationConfig, tests: list[str],
                               text=True, timeout=timeout_s, check=False, env=env)
     except subprocess.TimeoutExpired:
         return (-1, "timed out")
+    except OSError as exc:
+        raise MutationError(f"cannot run test command {command!r}: {exc}") from exc
     return (proc.returncode, (proc.stdout + proc.stderr)[-400:])
 
 
@@ -399,12 +425,21 @@ def restore_interrupted(repo: Path, lock_path: Path) -> list[str]:
     if not lock_path.is_file():
         return []
     restored: list[str] = []
-    target_rel = lock_path.read_text(encoding="utf-8").strip()
+    try:
+        target_rel = lock_path.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise MutationError(f"{lock_path}: cannot read mutation lock file: {exc}") from exc
     if target_rel:
-        target = repo / target_rel
+        target = (repo / target_rel).resolve()
+        repo_resolved = repo.resolve()
+        if target == repo_resolved or repo_resolved not in target.parents:
+            raise MutationError(f"lock file names a path outside the repo: {target_rel!r}")
         backup = target.with_name(target.name + BACKUP_SUFFIX)
         if backup.is_file():
-            shutil.move(str(backup), str(target))
+            try:
+                shutil.move(str(backup), str(target))
+            except OSError as exc:
+                raise MutationError(f"{target_rel}: cannot restore mutant backup: {exc}") from exc
             invalidate_bytecode(target)
             restored.append(target_rel)
     lock_path.unlink(missing_ok=True)
@@ -433,31 +468,44 @@ class MutationRunner:
         run, where the cost is irrelevant next to the test executions that follow.
         """
         restored = []
+        failures: list[str] = []
         for backup in sorted(self.repo.rglob(f"*{BACKUP_SUFFIX}")):
             target = backup.with_name(backup.name[: -len(BACKUP_SUFFIX)])
-            shutil.move(str(backup), str(target))
-            invalidate_bytecode(target)
+            try:
+                shutil.move(str(backup), str(target))
+                invalidate_bytecode(target)
+            except (OSError, MutationError) as exc:
+                failures.append(f"{backup.relative_to(self.repo)}: {exc}")
+                continue
             restored.append(str(target.relative_to(self.repo)))
         if self.lock_path is not None:
             self.lock_path.unlink(missing_ok=True)
+        if failures:
+            raise MutationError(
+                "could not restore every orphaned mutant backup:\n  "
+                + "\n  ".join(failures))
         return restored
 
     @contextmanager
     def _swapped(self, path: Path, original: bytes, replacement: bytes) -> Iterator[None]:
         """Hold a file's content swapped for the duration of one test run, and always undo it."""
         backup = path.with_name(path.name + BACKUP_SUFFIX)
-        if self.lock_path is not None:
-            self.lock_path.parent.mkdir(parents=True, exist_ok=True)
-            self.lock_path.write_text(str(path.relative_to(self.repo)), encoding="utf-8")
         try:
-            backup.write_bytes(original)
-            path.write_bytes(replacement)
-            invalidate_bytecode(path)
-            yield
+            if self.lock_path is not None:
+                self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+                self.lock_path.write_text(str(path.relative_to(self.repo)), encoding="utf-8")
+            try:
+                backup.write_bytes(original)
+                path.write_bytes(replacement)
+                invalidate_bytecode(path)
+                yield
+            finally:
+                path.write_bytes(original)
+                invalidate_bytecode(path)
+                backup.unlink(missing_ok=True)
+        except OSError as exc:
+            raise MutationError(f"{path}: cannot swap mutant into place: {exc}") from exc
         finally:
-            path.write_bytes(original)
-            invalidate_bytecode(path)
-            backup.unlink(missing_ok=True)
             if self.lock_path is not None:
                 self.lock_path.unlink(missing_ok=True)
 
@@ -466,8 +514,12 @@ class MutationRunner:
 
     def shard_key(self, shard: MutationShard) -> tuple[str, str, str, str]:
         """Everything that could change any verdict about this shard."""
+        try:
+            source_bytes = (self.repo / shard.source).read_bytes()
+        except OSError as exc:
+            raise MutationError(f"{shard.source}: cannot read for mutation: {exc}") from exc
         return (shard.source,
-                hashlib.sha1((self.repo / shard.source).read_bytes()).hexdigest(),
+                hashlib.sha1(source_bytes).hexdigest(),
                 sha_of([self.repo / t for t in shard.tests]),
                 self.command_sha)
 
@@ -484,7 +536,10 @@ class MutationRunner:
             report.probes_cached += 1
             return cached[0]
         path = self.repo / shard.source
-        original = path.read_bytes()
+        try:
+            original = path.read_bytes()
+        except OSError as exc:
+            raise MutationError(f"{shard.source}: cannot read for mutation: {exc}") from exc
         with self._swapped(path, original, SENTINEL):
             code, _ = self._run_tests(shard.tests, self.config.timeout_s)
         self.cache.put_probe("sentinel", key, code != 0, "")
@@ -512,7 +567,10 @@ class MutationRunner:
     def run_shard(self, shard: MutationShard, key: tuple[str, str, str, str],
                   report: MutationReport) -> Iterator[MutantResult]:
         path = self.repo / shard.source
-        original = path.read_bytes()
+        try:
+            original = path.read_bytes()
+        except OSError as exc:
+            raise MutationError(f"{shard.source}: cannot read for mutation: {exc}") from exc
         _, source_sha, tests_sha, _ = key
         survivors_by_anchor: set[str] = set()
 
@@ -579,7 +637,6 @@ def run(repo: Path, profile: Profile, cache_path: Path,
     report.shards = len(shards)
     cache = MutationCache(cache_path)
     runner = MutationRunner(repo, config, cache, lock_path)
-    runner.restore_orphans()
 
     by_mutant = {m.id: m for shard in shards for m in shard.mutants}
     survivors: dict[str, list[Mutant]] = {}
@@ -587,6 +644,7 @@ def run(repo: Path, profile: Profile, cache_path: Path,
     with_tests = [s for s in shards if s.tests]
     unexercised: list[str] = []
     try:
+        runner.restore_orphans()
         for shard in shards:
             key = runner.shard_key(shard)
             runner.baseline(shard, key, report)

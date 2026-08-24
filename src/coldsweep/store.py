@@ -6,6 +6,7 @@ import json
 import os
 import re
 import sqlite3
+import sys
 import tempfile
 from collections.abc import Iterable
 from pathlib import Path
@@ -113,12 +114,19 @@ def list_tasks(repo: Path) -> list[str]:
     root = repo.resolve() / COLDSWEEP_DIR / TASKS_DIR
     if not root.is_dir():
         return []
-    return sorted(entry.name for entry in root.iterdir() if (entry / "profile.yaml").is_file())
+    try:
+        entries = list(root.iterdir())
+    except OSError as exc:
+        raise StoreError(f"cannot list {root}: {exc}") from exc
+    return sorted(entry.name for entry in entries if (entry / "profile.yaml").is_file())
 
 
 def atomic_write(path: Path, data: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".tmp-", suffix=path.suffix)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".tmp-", suffix=path.suffix)
+    except OSError as exc:
+        raise StoreError(f"cannot write {path}: {exc}") from exc
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(data)
@@ -137,7 +145,14 @@ def load_profile(paths: Paths) -> Profile:
             f"  {hint}\n"
             f"  create it with: coldsweep init <template> --task {paths.task}"
         )
-    raw = yaml.safe_load(paths.profile.read_text(encoding="utf-8")) or {}
+    try:
+        text = paths.profile.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise StoreError(f"cannot read {paths.profile}: {exc}") from exc
+    try:
+        raw = yaml.safe_load(text) or {}
+    except yaml.YAMLError as exc:
+        raise StoreError(f"invalid profile {paths.profile}:\n{exc}") from exc
     try:
         return Profile.model_validate(raw)
     except ValidationError as exc:
@@ -171,7 +186,12 @@ def append_rule(paths: Paths, profile: Profile, rule: Rule) -> Profile:
     before anything is written. A splice that would change anything beyond the taxonomy is an
     error naming the block to paste, never a silent rewrite.
     """
-    text = paths.profile.read_text(encoding="utf-8")
+    if not paths.profile.is_file():
+        raise StoreError(f"task {paths.task!r} has no profile at {paths.profile}")
+    try:
+        text = paths.profile.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise StoreError(f"cannot read {paths.profile}: {exc}") from exc
     block = _render_rule(rule)
     manual = "\n".join(block)
     match = _RULES_BLOCK.search(text)
@@ -208,8 +228,12 @@ def append_rule(paths: Paths, profile: Profile, rule: Rule) -> Profile:
 def load_findings(paths: Paths) -> list[Finding]:
     if not paths.findings.is_file():
         return []
+    try:
+        text = paths.findings.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise StoreError(f"cannot read {paths.findings}: {exc}") from exc
     out: list[Finding] = []
-    for lineno, line in enumerate(paths.findings.read_text(encoding="utf-8").splitlines(), start=1):
+    for lineno, line in enumerate(text.splitlines(), start=1):
         line = line.strip()
         if not line:
             continue
@@ -237,7 +261,11 @@ def load_round(path: Path) -> ScanRound:
     if not path.is_file():
         raise StoreError(f"no scan output at {path}")
     try:
-        return ScanRound.model_validate_json(path.read_text(encoding="utf-8"))
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise StoreError(f"cannot read {path}: {exc}") from exc
+    try:
+        return ScanRound.model_validate_json(text)
     except ValidationError as exc:
         raise StoreError(f"{path}: invalid scan output:\n{exc}") from exc
 
@@ -250,17 +278,24 @@ def save_run_record(paths: Paths, record: RunRecord) -> Path:
 
 def append_spend(paths: Paths, record: SpendRecord) -> None:
     """Append one agent call to the ledger. Append-only, one line, never rewritten."""
-    paths.root.mkdir(parents=True, exist_ok=True)
-    with paths.spend.open("a", encoding="utf-8") as fh:
-        fh.write(record.model_dump_json() + "\n")
+    try:
+        paths.root.mkdir(parents=True, exist_ok=True)
+        with paths.spend.open("a", encoding="utf-8") as fh:
+            fh.write(record.model_dump_json() + "\n")
+    except OSError as exc:
+        raise StoreError(f"cannot write {paths.spend}: {exc}") from exc
 
 
 def load_spend(paths: Paths) -> list[SpendRecord]:
     """Every recorded agent call. A malformed line is a hard error, like every other store."""
     if not paths.spend.is_file():
         return []
+    try:
+        text = paths.spend.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise StoreError(f"cannot read {paths.spend}: {exc}") from exc
     out: list[SpendRecord] = []
-    for lineno, line in enumerate(paths.spend.read_text(encoding="utf-8").splitlines(), start=1):
+    for lineno, line in enumerate(text.splitlines(), start=1):
         line = line.strip()
         if not line:
             continue
@@ -275,8 +310,12 @@ def completed_rounds(paths: Paths) -> list[int]:
     """Rounds that finished ingest. A scanned-but-not-ingested round does not count."""
     if not paths.runs.is_dir():
         return []
+    try:
+        entries = list(paths.runs.glob("*.ingest.json"))
+    except OSError as exc:
+        raise StoreError(f"cannot list {paths.runs}: {exc}") from exc
     rounds: list[int] = []
-    for entry in paths.runs.glob("*.ingest.json"):
+    for entry in entries:
         stem = entry.name.removesuffix(".ingest.json")
         if stem.isdigit():
             rounds.append(int(stem))
@@ -296,7 +335,9 @@ def incomplete_rounds(paths: Paths) -> list[int]:
         try:
             record = RunRecord.model_validate_json(
                 paths.ingest_file(round_no).read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, ValidationError):
+        except (OSError, UnicodeDecodeError, ValidationError) as exc:
+            print(f"coldsweep: {paths.ingest_file(round_no)}: unreadable ingest record, "
+                  f"treating round {round_no} as incomplete: {exc}", file=sys.stderr)
             out.append(round_no)
             continue
         if record.failed_shards:
@@ -348,9 +389,15 @@ def rebuild_index(paths: Paths, profile: Profile, findings: Iterable[Finding] | 
     """Derived index only -- dropped and rebuilt from findings.jsonl on every ingest."""
     items = list(findings) if findings is not None else load_findings(paths)
     taxonomy = profile.rule_ids
-    paths.root.mkdir(parents=True, exist_ok=True)
-    paths.index.unlink(missing_ok=True)
-    con = sqlite3.connect(paths.index)
+    try:
+        paths.root.mkdir(parents=True, exist_ok=True)
+        paths.index.unlink(missing_ok=True)
+    except OSError as exc:
+        raise StoreError(f"cannot rebuild {paths.index}: {exc}") from exc
+    try:
+        con = sqlite3.connect(paths.index)
+    except sqlite3.Error as exc:
+        raise StoreError(f"cannot open {paths.index}: {exc}") from exc
     try:
         con.executescript(SCHEMA)
         con.executemany(
@@ -373,6 +420,8 @@ def rebuild_index(paths: Paths, profile: Profile, findings: Iterable[Finding] | 
             ],
         )
         con.commit()
+    except sqlite3.Error as exc:
+        raise StoreError(f"cannot rebuild {paths.index}: {exc}") from exc
     finally:
         con.close()
     return paths.index

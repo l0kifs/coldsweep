@@ -37,7 +37,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         payload = json.loads(sys.stdin.read() or "{}")
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError):
         payload = None
     if not isinstance(payload, dict):
         # The loop-breaker below lives in this payload. Unable to read it, the hook cannot rule
@@ -53,8 +53,20 @@ def main(argv: list[str] | None = None) -> int:
         return ALLOW_STOP
 
     cwd = payload.get("cwd")
-    result = subprocess.run([sys.executable, "-m", "coldsweep", "converged", "--task", task],
-                            cwd=cwd, capture_output=True, text=True, check=False)
+    if not (cwd is None or (isinstance(cwd, str) and os.path.isdir(cwd))):
+        # An untrusted or stale cwd; falling back to the hook's own working directory is safer
+        # than handing subprocess.run a value it can't chdir into.
+        cwd = None
+
+    try:
+        result = subprocess.run([sys.executable, "-m", "coldsweep", "converged", "--task", task],
+                                cwd=cwd, capture_output=True, text=True, check=False)
+    except (OSError, UnicodeDecodeError) as exc:
+        # Same tradeoff as the malformed-payload case above: a wrongly allowed stop costs one
+        # manual re-check, a wrongly blocked one can't be recovered from inside the session.
+        print(f"coldsweep-stop-hook: failed to run coldsweep converged: {exc}; allowing the stop "
+              "rather than risking a gate that cannot be reopened.", file=sys.stderr)
+        return ALLOW_STOP
     if result.returncode == ALLOW_STOP:
         return ALLOW_STOP
 

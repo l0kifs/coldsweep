@@ -22,6 +22,7 @@ from .models import (
     Profile,
     RawFinding,
     Rule,
+    RunRecord,
     ScanRound,
     Shard,
     ShardResult,
@@ -74,8 +75,13 @@ def _load(repo: Path | None, task: str) -> tuple[Paths, Profile, list[Finding]]:
 def _recover_interrupted_mutation(paths: Paths) -> None:
     """Every command checks. A killed mutation run leaves a mutant in the working tree, and
     the next thing the user does must not be the one that quietly builds on it."""
-    for restored in mutation.restore_interrupted(paths.repo, paths.mutation_lock):
-        typer.secho(f"restored {restored}: a mutation run was interrupted and had left this file "
+    try:
+        restored = mutation.restore_interrupted(paths.repo, paths.mutation_lock)
+    except (OSError, mutation.MutationError) as exc:
+        _fail(f"could not recover an interrupted mutation run: {exc}")
+        return
+    for r in restored:
+        typer.secho(f"restored {r}: a mutation run was interrupted and had left this file "
                     f"holding a mutant", fg=typer.colors.YELLOW, err=True)
 
 
@@ -100,6 +106,23 @@ def _fail(message: str, code: int = 2) -> None:
     raise typer.Exit(code)
 
 
+def _save_findings(paths: Paths, profile: Profile, findings: list[Finding],
+                   record: RunRecord | None = None) -> None:
+    """Findings, an optional run record, and the index rebuilt from them: one write unit.
+
+    Everything in ``store`` reports failure as ``StoreError``; caught here so the message names
+    the task state that could not be written, rather than surfacing from ``main`` with no idea
+    which write failed.
+    """
+    try:
+        store.save_findings(paths, findings)
+        if record is not None:
+            store.save_run_record(paths, record)
+        store.rebuild_index(paths, profile, findings)
+    except StoreError as exc:
+        _fail(f"could not save findings: {exc}")
+
+
 @app.command()
 def init(
     task: Annotated[str, _task_opt()],
@@ -122,13 +145,17 @@ def init(
     if paths.profile.exists() and not force:
         _fail(f"task {task!r} already exists at {paths.root}; pass --force to overwrite its profile")
 
-    paths.runs.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(source, paths.profile)
-    for committed in (paths.findings, paths.spend):
-        if not committed.exists():
-            committed.write_text("", encoding="utf-8")
-    (paths.container / ".gitignore").write_text(
-        "tasks/*/index.sqlite\ntasks/*/mutants.sqlite\ntasks/*/mutants.lock\n", encoding="utf-8")
+    try:
+        paths.runs.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, paths.profile)
+        for committed in (paths.findings, paths.spend):
+            if not committed.exists():
+                committed.write_text("", encoding="utf-8")
+        (paths.container / ".gitignore").write_text(
+            "tasks/*/index.sqlite\ntasks/*/mutants.sqlite\ntasks/*/mutants.lock\n", encoding="utf-8")
+    except OSError as exc:
+        _fail(f"could not scaffold task {task!r}: {exc}")
+        return
     store.load_profile(paths)
 
     created = store.load_profile(paths)
@@ -209,6 +236,36 @@ def shard(
     typer.echo(f"\n{len(shards)} shard(s), {sum(len(s.files) for s in shards)} file(s)", err=True)
 
 
+def _run_subsystems(paths: Paths, profile: Profile, n: int) -> list[RawFinding]:
+    """Every deterministic subsystem this profile runs, into one list.
+
+    Each is exhaustive over its own rules and blind to the others', so a profile that runs two
+    of them must carry both results.
+    """
+    out: list[RawFinding] = []
+    if profile.spec is not None:
+        drifted = _blockers(paths, profile)
+        if drifted:
+            for reason in drifted:
+                typer.secho(f"error: {reason}", fg=typer.colors.RED, err=True)
+            raise typer.Exit(2)
+        traced, spec_report = spec_mod.run(paths.repo, profile, spec_mod.load_lock(paths.spec_lock))
+        out.extend(traced)
+        typer.echo(f"round {n}: spec {spec_report.items} item(s) -- implemented "
+                   f"{spec_report.implemented}, unimplemented {spec_report.unimplemented}, "
+                   f"stale markers {spec_report.stale_markers}")
+    if profile.mutation is not None:
+        survivors, report = mutation.run(paths.repo, profile, paths.mutants, paths.mutation_lock)
+        out.extend(survivors)
+        for source in report.unexercised:
+            typer.secho(f"round {n}: {source} is never imported by its paired tests",
+                        fg=typer.colors.YELLOW, err=True)
+        typer.echo(f"round {n}: mutation {report.mutants} mutant(s) over {report.shards} file(s) "
+                   f"-- killed {report.killed}, survived {report.survived}, "
+                   f"no tests {report.no_tests}, cached {report.cached}, {report.duration_s}s")
+    return out
+
+
 @app.command()
 def scan(
     task: Annotated[str, _task_opt()],
@@ -225,33 +282,9 @@ def scan(
     for warning in shard_warnings(profile):
         typer.secho(f"warning: {warning}", fg=typer.colors.YELLOW, err=True)
 
-    # Every deterministic subsystem appends to one list. Each is exhaustive over its own rules
-    # and blind to the others', so a profile that runs two of them must carry both results.
-    deterministic: list[RawFinding] = []
     try:
-        if profile.spec is not None:
-            drifted = _blockers(paths, profile)
-            if drifted:
-                for reason in drifted:
-                    typer.secho(f"error: {reason}", fg=typer.colors.RED, err=True)
-                raise typer.Exit(2)
-            traced, spec_report = spec_mod.run(paths.repo, profile, spec_mod.load_lock(paths.spec_lock))
-            deterministic.extend(traced)
-            typer.echo(f"round {n}: spec {spec_report.items} item(s) -- implemented "
-                       f"{spec_report.implemented}, unimplemented {spec_report.unimplemented}, "
-                       f"stale markers {spec_report.stale_markers}")
-        if profile.mutation is not None:
-            survivors, mutation_report = mutation.run(paths.repo, profile, paths.mutants,
-                                                      paths.mutation_lock)
-            deterministic.extend(survivors)
-            for source in mutation_report.unexercised:
-                typer.secho(f"round {n}: {source} is never imported by its paired tests",
-                            fg=typer.colors.YELLOW, err=True)
-            typer.echo(f"round {n}: mutation {mutation_report.mutants} mutant(s) over "
-                       f"{mutation_report.shards} file(s) -- killed {mutation_report.killed}, "
-                       f"survived {mutation_report.survived}, no tests {mutation_report.no_tests}, "
-                       f"cached {mutation_report.cached}, {mutation_report.duration_s}s")
-        mech = _deterministic_shards(paths, profile, shards, n, deterministic)
+        mech = _deterministic_shards(paths, profile, shards, n,
+                                     _run_subsystems(paths, profile, n))
     except (mechanical.MechanicalError, mutation.MutationError, spec_mod.SpecError) as exc:
         _fail(str(exc))
         return
@@ -265,7 +298,11 @@ def scan(
     results: list[ShardResult] = asyncio.run(runner.scan(shards, n))
 
     scan_round = ScanRound(round=n, profile_version=profile.version, shards=[*results, *mech])
-    path = store.save_round(paths, scan_round)
+    try:
+        path = store.save_round(paths, scan_round)
+    except StoreError as exc:
+        _fail(f"could not save round {n}: {exc}")
+        return
 
     agent_count = sum(len(r.findings) for r in results)
     typer.echo(f"round {n}: {agent_count} agent finding(s) across {len(results)} shard(s) -> {path}")
@@ -323,7 +360,11 @@ def spec_freeze(
         _fail(str(exc))
         return
 
-    store.atomic_write(paths.spec_lock, lock.model_dump_json(indent=2) + "\n")
+    try:
+        store.atomic_write(paths.spec_lock, lock.model_dump_json(indent=2) + "\n")
+    except StoreError as exc:
+        _fail(f"could not write {paths.spec_lock}: {exc}")
+        return
     if previous is None:
         typer.secho(f"froze {len(lock.items)} spec item(s) from {profile.spec.path}", fg=typer.colors.GREEN)
     elif drift.clean:
@@ -442,9 +483,7 @@ def ingest(
 
     adjudicator = None if no_llm else _runner(paths, profile, scan_round.round).adjudicator()
     findings, record = merge.merge_round(findings, scan_round, profile, scan_round.round, adjudicator)
-    store.save_findings(paths, findings)
-    store.save_run_record(paths, record)
-    store.rebuild_index(paths, profile, findings)
+    _save_findings(paths, profile, findings, record)
 
     adjudication = f"adjudicated {record.adjudicated}"
     if record.adjudicator_calls:
@@ -473,7 +512,10 @@ def _snapshot_symbols(paths: Paths, todo: list[Finding]) -> None:
         if finding.file not in sources:
             try:
                 sources[finding.file] = (paths.repo / finding.file).read_text(encoding="utf-8")
-            except (OSError, UnicodeDecodeError):
+            except (OSError, UnicodeDecodeError) as exc:
+                typer.secho(f"  {finding.file}: could not read for pre-fix snapshot ({exc}); "
+                            f"an additive fix to it will not be distinguished from no change",
+                            fg=typer.colors.YELLOW, err=True)
                 sources[finding.file] = None
         source = sources[finding.file]
         body = spec_mod.symbol_text(source, finding.anchor) if source is not None else None
@@ -502,7 +544,11 @@ def _unproven_sources(paths: Paths, profile: Profile,
     """
     claimed = {by_id[o.id].file for r in outcomes.values() if not isinstance(r, AgentError)
                for o in r.results if o.outcome == "fixed" and o.id in by_id}
-    rejected = mutation.reject_failing_fixes(paths.repo, profile, sorted(claimed))
+    try:
+        rejected = mutation.reject_failing_fixes(paths.repo, profile, sorted(claimed))
+    except mutation.MutationError as exc:
+        _fail(str(exc))
+        return {}
     for source, detail in rejected.items():
         typer.secho(f"  {source}: paired tests fail after the fix; its findings stay open",
                     fg=typer.colors.RED, err=True)
@@ -565,6 +611,9 @@ def fix(
     todo = [f for f in findings
             if f.status == "open" and not converge.is_unclassified(f, profile)]
     if rule:
+        if rule not in profile.rule_ids:
+            _fail(f"no such rule {rule!r} in profile {profile.name!r}; known rules: "
+                  f"{', '.join(sorted(profile.rule_ids))}")
         todo = [f for f in todo if f.rule_id == rule]
     todo.sort(key=lambda f: (f.file, f.rule_id, f.id))
     if limit is not None:
@@ -588,8 +637,7 @@ def fix(
     rejected = _unproven_sources(paths, profile, outcomes, by_id)
     counts = _record_outcomes(outcomes, groups, by_id, rejected, n)
 
-    store.save_findings(paths, findings)
-    store.rebuild_index(paths, profile, findings)
+    _save_findings(paths, profile, findings)
     summary = (f"fixed {counts['fixed']}, disputed {counts['disputed']}, "
                f"failed files {counts['failed']}")
     if counts["unproven"]:
@@ -608,8 +656,7 @@ def verify_cmd(
     paths, profile, findings = _load(repo, task)
     n = max([*store.completed_rounds(paths), 0])
     stats = verify.verify_findings(paths.repo, profile, findings, n)
-    store.save_findings(paths, findings)
-    store.rebuild_index(paths, profile, findings)
+    _save_findings(paths, profile, findings)
     typer.echo(f"verified {stats['verified']}, reopened {stats['reopened']}, "
                f"deferred to next round {stats['deferred']}")
 
@@ -709,12 +756,18 @@ def converged(
     task: Annotated[str, _task_opt()],
     repo: Annotated[Path | None, _repo_opt()] = None,
 ) -> None:
-    """Exit 0 if converged, 1 otherwise. Prints nothing -- this is the gate."""
+    """Exit 0 if converged, 1 otherwise. Prints nothing on those outcomes -- this is the gate.
+
+    A genuine failure to evaluate (corrupt findings, bad scope, ...) is not the same as an
+    unconverged task: it is reported on stderr and exits 2, so a caller can tell "not done yet"
+    from "could not tell".
+    """
     try:
         paths, profile, findings = _load(repo, task)
         report = _evaluate(paths, profile, findings)
-    except (StoreError, ShardError, spec_mod.SpecError):
-        raise typer.Exit(1) from None
+    except (StoreError, ShardError, spec_mod.SpecError) as exc:
+        _fail(f"could not evaluate convergence: {exc}")
+        return
     raise typer.Exit(0 if report.converged else 1)
 
 
@@ -739,8 +792,7 @@ def adjudicate(
     profile, touched = _triage_unclassified(paths, profile, unclassified, n, wontfix_unclassified)
     touched += _triage_disputes(disputes, n, accept_disputes)
 
-    store.save_findings(paths, findings)
-    store.rebuild_index(paths, profile, findings)
+    _save_findings(paths, profile, findings)
     typer.echo(f"\nadjudicated {touched} finding(s)")
 
 
@@ -763,7 +815,7 @@ def _triage_unclassified(paths: Paths, profile: Profile, unclassified: list[Find
                 typer.secho(f"  mode must be 'absence' or 'presence', got {mode!r}; skipped",
                             fg=typer.colors.RED, err=True)
                 continue
-            except StoreError as exc:
+            except (StoreError, OSError) as exc:
                 typer.secho(f"  {exc}", fg=typer.colors.RED, err=True)
                 continue
             f.log(round_no, "classify", detail=f"rule {f.rule_id} added to taxonomy")

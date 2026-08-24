@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import shlex
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,7 +26,7 @@ from .models import (
     SpendRecord,
     Usage,
 )
-from .spec import spec_context
+from .spec import SpecError, spec_context
 
 PROMPT_DIR = Path(__file__).parent / "prompts"
 T = TypeVar("T", bound=BaseModel)
@@ -36,7 +37,10 @@ class AgentError(RuntimeError):
 
 
 def render(template: str, **values: str) -> str:
-    text = (PROMPT_DIR / template).read_text(encoding="utf-8")
+    try:
+        text = (PROMPT_DIR / template).read_text(encoding="utf-8")
+    except OSError as exc:
+        raise AgentError(f"cannot read prompt template {template!r}: {exc}") from exc
     for key, value in values.items():
         text = text.replace("{{" + key + "}}", value)
     return text
@@ -190,10 +194,26 @@ class Runner:
         self._round = round_no
 
     def _record(self, phase: Phase, attempt: int, usage: Usage, ok: bool) -> None:
-        """Bill one subprocess. Every phase goes through here, so nothing spends unrecorded."""
-        if self._ledger is not None:
-            self._ledger(SpendRecord(round=self._round, phase=phase.name, model=phase.model,
-                                     attempt=attempt, ok=ok, usage=usage))
+        """Bill one subprocess. Every phase goes through here, so nothing spends unrecorded.
+
+        A ledger write failure (disk full, permissions) must not take the rest of a running
+        ``asyncio.gather()`` batch down with it -- the spend line is lost, but sibling
+        scan/fix/adjudicate results are not, and the failure is still reported, not hidden.
+
+        Caught broadly on purpose. The ledger is a side channel supplied by the caller, and
+        narrowing this to one exception type is how it stopped working the first time: the
+        store began reporting write failures as ``StoreError`` and an ``except OSError`` here
+        silently became unreachable.
+        """
+        if self._ledger is None:
+            return
+        record = SpendRecord(round=self._round, phase=phase.name, model=phase.model,
+                             attempt=attempt, ok=ok, usage=usage)
+        try:
+            self._ledger(record)
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            print(f"warning: could not record spend for {phase.name} phase (attempt {attempt}): "
+                 f"{exc}", file=sys.stderr)
 
     def scan_phase(self, round_no: int) -> Phase:
         """Alternate to ``scan_alt`` on even rounds -- same-family agents share blind spots.
@@ -216,12 +236,15 @@ class Runner:
 
     async def _exec(self, phase: Phase, prompt: str) -> str:
         argv = build_argv(self.cfg, phase)
-        proc = await asyncio.create_subprocess_exec(
-            *argv, cwd=str(self.repo),
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *argv, cwd=str(self.repo),
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except OSError as exc:
+            raise AgentError(f"{phase.name} agent failed to start ({shlex.join(argv)}): {exc}") from exc
         try:
             out, err = await asyncio.wait_for(proc.communicate(prompt.encode("utf-8")),
                                               timeout=self.cfg.timeout_s)
@@ -230,6 +253,12 @@ class Runner:
             await proc.wait()
             raise AgentError(f"{phase.name} agent timed out after {self.cfg.timeout_s}s "
                              f"({shlex.join(argv)})") from None
+        except BaseException:
+            # Any other failure here (cancellation included) still leaves the process running
+            # unless we reap it ourselves -- only the timeout path above does that on its own.
+            proc.kill()
+            await proc.wait()
+            raise
         if proc.returncode != 0:
             raise AgentError(f"{phase.name} agent exited {proc.returncode}: {err.decode('utf-8', 'replace')[:400]}")
         return out.decode("utf-8", "replace")
@@ -273,15 +302,15 @@ class Runner:
         return "\n".join(lines) or "- (profile defines no rules)"
 
     async def scan_shard(self, shard: Shard, phase: Phase) -> ShardResult:
-        prompt = render(
-            "scan.md",
-            files="\n".join(f"- `{f}`" for f in shard.files),
-            rules=self._rules_block(),
-            context=self.context(shard.files),
-        )
         try:
+            prompt = render(
+                "scan.md",
+                files="\n".join(f"- `{f}`" for f in shard.files),
+                rules=self._rules_block(),
+                context=self.context(shard.files),
+            )
             result, attempts, usage = await self.call(phase, prompt, ScanResult)
-        except AgentError as exc:
+        except (AgentError, SpecError) as exc:
             return ShardResult(shard=shard.id, files=shard.files, ok=False, error=str(exc),
                                attempts=self.cfg.retries + 1, model=phase.model)
         return ShardResult(shard=shard.id, files=shard.files, ok=True, attempts=attempts,
@@ -363,11 +392,10 @@ class Runner:
     def adjudicator(self) -> Adjudicator:
         """Sync adapter used by merge. Any failure resolves to ``different`` -- never toward loss.
 
-        Must be called from sync code: it opens its own event loop per pair.
+        Must be called from sync code: it opens its own event loop per pair. Failures are left to
+        propagate: ``merge`` already catches them around this call and records the real reason,
+        which a catch here would erase before merge ever saw it.
         """
         def decide(a: Finding, b: Finding) -> bool:
-            try:
-                return asyncio.run(self.adjudicate_pair(a, b)).same
-            except (AgentError, RuntimeError):
-                return False
+            return asyncio.run(self.adjudicate_pair(a, b)).same
         return decide

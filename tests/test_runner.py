@@ -127,12 +127,18 @@ def test_a_failed_shard_fails_the_round_rather_than_reducing_coverage(repo: Path
     assert len(ScanRound(round=1, shards=results).failed_shards) == 2
 
 
-def test_the_adjudicator_falls_back_to_different_when_the_agent_fails(repo: Path, monkeypatch):
+def test_the_adjudicator_reports_its_failure_instead_of_ruling_different(repo: Path, monkeypatch):
+    """The verdict is still `different`, but merge decides that and records why.
+
+    Swallowing the error here wrote a bare "different" into the merge record with no way to
+    tell a real ruling from a dead agent.
+    """
     monkeypatch.setenv("STUB_MODE", "garbage")
     from coldsweep.models import RawFinding
     a = RawFinding(rule_id="r", anchor="src/a.py::f", description="x").to_finding("s", 1)
     b = RawFinding(rule_id="r", anchor="src/a.py::g", description="y").to_finding("s", 1)
-    assert Runner(repo, stub_profile()).adjudicator()(a, b) is False
+    with pytest.raises(AgentError):
+        Runner(repo, stub_profile()).adjudicator()(a, b)
 
 
 def test_rules_a_subsystem_already_decides_are_kept_out_of_the_scan_prompt():
