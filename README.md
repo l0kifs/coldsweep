@@ -39,6 +39,13 @@ be cleared by scanning, so once nothing is open and the quiet window has closed,
 and points at `coldsweep adjudicate` rather than paying for rounds that cannot change the outcome.
 Findings that genuinely keep reappearing still run out the `max_rounds` budget.
 
+That early stop needs *nothing else* to be open, so on a task that keeps finding work the
+dispute backlog grows underneath it — measured on this repository, 0, 12, 18 then 24 across four
+rounds, every one of them holding the gate shut. The count is now reported after each round, and
+`convergence.max_disputes` stops the run once the backlog reaches a size you would rather triage
+than keep paying past. It is unset by default: the right bound is a judgement about the
+repository, not a number this tool can pick.
+
 ### Tasks
 
 Work is organised into named tasks, each with its own taxonomy, finding set and round
@@ -218,6 +225,7 @@ files_per_shard: 1
 convergence:
   k: 2
   max_rounds: 8
+  max_disputes: null      # optional; stop once this many disputes await triage
 models:
   scan: sonnet
   fix: sonnet

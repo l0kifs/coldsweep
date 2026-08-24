@@ -836,6 +836,16 @@ def run(
             typer.secho(f"  run: coldsweep adjudicate --task {task}", fg=typer.colors.YELLOW, err=True)
             _summary(paths)
             raise typer.Exit(1)
+        pending = len(report.disputed_pending_ids)
+        bound = profile.convergence.max_disputes
+        if bound is not None and pending >= bound:
+            typer.secho(f"stopping after {len(rounds)} round(s): {pending} dispute(s) waiting on "
+                        f"triage, at or past max_disputes={bound}. Scanning cannot clear a "
+                        f"dispute, and each one holds the gate shut",
+                        fg=typer.colors.YELLOW, err=True)
+            typer.secho(f"  run: coldsweep adjudicate --task {task}", fg=typer.colors.YELLOW, err=True)
+            _summary(paths)
+            raise typer.Exit(1)
         if len(rounds) >= ceiling:
             spent = profile.budget_bounded
             colour = typer.colors.YELLOW if spent else typer.colors.RED
@@ -872,6 +882,7 @@ def run(
                             f"open for the next round", fg=typer.colors.YELLOW, err=True)
             verify_cmd(task=task, repo=repo)
         _report_round_spend(paths, n)
+        _report_dispute_backlog(paths, profile, n)
 
 
 def _report_round_spend(paths: Paths, round_no: int) -> None:
@@ -883,6 +894,21 @@ def _report_round_spend(paths: Paths, round_no: int) -> None:
     phases = "  ".join(f"{phase} ${s.cost_usd:,.2f} ({s.calls})"
                        for phase, s in converge.spend_by(records, "phase").items())
     typer.echo(f"round {round_no}: cost ${total.cost_usd:,.2f} across {total.calls} call(s) -- {phases}")
+
+
+def _report_dispute_backlog(paths: Paths, profile: Profile, round_no: int) -> None:
+    """Say how much work the loop has handed back, as it accumulates rather than at the end.
+
+    Nothing a later round does can clear a dispute, so a backlog growing quietly in the
+    background is a budget being spent on rounds that cannot open the gate.
+    """
+    pending = converge.disputed_pending(store.load_findings(paths))
+    if not pending:
+        return
+    bound = profile.convergence.max_disputes
+    limit = f" of max_disputes={bound}" if bound is not None else ""
+    typer.secho(f"round {round_no}: {len(pending)} dispute(s){limit} waiting on triage; "
+                f"the gate stays shut until they are ruled on", fg=typer.colors.YELLOW, err=True)
 
 
 def _summary(paths: Paths) -> None:

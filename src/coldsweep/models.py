@@ -351,6 +351,17 @@ class Convergence(BaseModel):
 
     k: int = Field(default=2, ge=1)
     max_rounds: int = Field(default=8, ge=1)
+    max_disputes: int | None = Field(default=None, ge=1)
+    """Stop the loop once this many disputes are waiting on triage. Unset means no bound.
+
+    A dispute is the one kind of work the loop cannot do: scanning never clears it, and each
+    one holds the gate shut until a human rules on it. They accumulate -- measured on this
+    repository, 0, 12, 18 then 24 across four rounds -- so a run can spend its whole budget on
+    rounds that could not have opened the gate whatever they found.
+
+    Left unset by default because the right bound is a judgement about the repository, not a
+    number this tool can pick. The backlog is reported after every round either way.
+    """
 
 
 class Models(BaseModel):

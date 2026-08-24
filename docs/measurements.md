@@ -314,7 +314,7 @@ enumeration quality — multiplies this floor directly.
 
 ## Defects this run surfaced
 
-Items 1 through 6 and 8 are fixed; 7 stands.
+All eight are fixed.
 
 1. ~~**`runner.py` discards the cost envelope.**~~ `unwrap_envelope` returned only `result`, so
    everything in this document had to be captured by wrapping the `claude` binary. **Fixed** —
@@ -382,8 +382,19 @@ Items 1 through 6 and 8 are fixed; 7 stands.
    while still being a paid agent call. **Fixed** — `RunRecord.adjudicator_calls` counts every
    invocation and ingest now prints `adjudicated 0 of 85 call(s)`, with the cost in the round's
    spend line.
-7. **The dispute backlog is unbounded and blocks the gate.** `issues` ended with 24 disputed
-   findings after 4 rounds, growing every round, with no automatic adjudication in `run`.
+7. ~~**The dispute backlog is unbounded and blocks the gate.**~~ `issues` ended with 24 disputed
+   findings after 4 rounds, growing every round — 0, 12, 18, 24 — each one holding the gate
+   shut and none of them clearable by scanning. The existing early stop could not fire, because
+   it requires nothing else to be open and this task kept finding work, so the backlog grew
+   underneath a run that was spending its budget on rounds that could not have opened the gate.
+
+   **Fixed** — the pending count is reported after every round, and `convergence.max_disputes`
+   stops the run once the backlog reaches it. Verified with the `stubborn` stub, which disputes
+   everything: unbounded runs 3 rounds, `max_disputes: 2` stops after 1. Both exit non-zero and
+   point at `coldsweep adjudicate`.
+
+   Left unset by default. The bound is a judgement about the repository, and a default that
+   stopped runs people wanted to continue would be a worse failure than the one it prevents.
 8. ~~**~40% of fixes do not survive verification**~~ on `issues` — 37 of 89 reopened. Two
    causes, both measured, neither of them the agent failing:
 
