@@ -14,7 +14,17 @@ from pydantic import ValidationError
 
 from . import converge, mechanical, merge, mutation, store, verify
 from . import spec as spec_mod
-from .models import Finding, Profile, RawFinding, Rule, ScanRound, Shard, ShardResult
+from .models import (
+    Finding,
+    FixOutcome,
+    FixResult,
+    Profile,
+    RawFinding,
+    Rule,
+    ScanRound,
+    Shard,
+    ShardResult,
+)
 from .runner import AgentError, Runner
 from .shard import ShardError, build_shards, resolve_editable, shard_warnings
 from .store import Paths, StoreError
@@ -430,6 +440,64 @@ def ingest(
                     f"-- run `coldsweep adjudicate`", fg=typer.colors.YELLOW)
 
 
+def _unproven_sources(paths: Paths, profile: Profile,
+                      outcomes: dict[str, FixResult | AgentError],
+                      by_id: dict[str, Finding]) -> dict[str, str]:
+    """Sources a fix claimed to resolve whose paired tests do not pass. Reports as it goes.
+
+    A profile whose remedy is a test does not get to record `fixed` on the agent's word.
+    """
+    claimed = {by_id[o.id].file for r in outcomes.values() if not isinstance(r, AgentError)
+               for o in r.results if o.outcome == "fixed" and o.id in by_id}
+    rejected = mutation.reject_failing_fixes(paths.repo, profile, sorted(claimed))
+    for source, detail in rejected.items():
+        typer.secho(f"  {source}: paired tests fail after the fix; its findings stay open",
+                    fg=typer.colors.RED, err=True)
+        typer.secho(f"    {detail.strip().splitlines()[-1] if detail.strip() else '(no output)'}",
+                    fg=typer.colors.RED, err=True)
+    return rejected
+
+
+def _record_outcomes(outcomes: dict[str, FixResult | AgentError],
+                     groups: dict[str, list[Finding]], by_id: dict[str, Finding],
+                     rejected: dict[str, str], round_no: int) -> dict[str, int]:
+    """Apply what each fix agent reported to the finding set. Counts by resulting state."""
+    counts = {"fixed": 0, "disputed": 0, "failed": 0, "unproven": 0}
+    for file, result in outcomes.items():
+        if isinstance(result, AgentError):
+            typer.secho(f"  {file}: fix agent failed: {result}", fg=typer.colors.RED, err=True)
+            counts["failed"] += 1
+            continue
+        for outcome in result.results:
+            target = by_id.get(outcome.id)
+            if target is None:
+                typer.secho(f"  {file}: fix agent reported unknown finding id {outcome.id}",
+                            fg=typer.colors.YELLOW, err=True)
+                continue
+            counts[_apply_outcome(target, outcome, rejected, round_no)] += 1
+        for missing in {f.id for f in groups[file]} - {o.id for o in result.results}:
+            typer.secho(f"  {file}: fix agent did not report on {missing}",
+                        fg=typer.colors.YELLOW, err=True)
+    return counts
+
+
+def _apply_outcome(target: Finding, outcome: FixOutcome, rejected: dict[str, str],
+                   round_no: int) -> str:
+    """Move one finding to the state its fix earned. Returns which state that was."""
+    if outcome.outcome != "fixed":
+        target.status = "disputed"
+        target.adjudicated = False
+        target.log(round_no, "dispute", detail=outcome.detail)
+        return "disputed"
+    if target.file in rejected:
+        # Stays open: the next round re-derives it, exactly as if nothing had happened.
+        target.log(round_no, "fix-unproven", detail=f"paired tests fail: {rejected[target.file]}")
+        return "unproven"
+    target.status = "fixed"
+    target.log(round_no, "fix", detail=outcome.detail)
+    return "fixed"
+
+
 @app.command()
 def fix(
     task: Annotated[str, _task_opt()],
@@ -462,36 +530,18 @@ def fix(
     by_id = {f.id: f for f in findings}
     editable = resolve_editable(paths.repo, profile) if profile.fix_scope == "task" else None
     outcomes = asyncio.run(Runner(paths.repo, profile).fix(groups, editable))
-    fixed = disputed = failed = 0
-    for file, result in outcomes.items():
-        if isinstance(result, AgentError):
-            typer.secho(f"  {file}: fix agent failed: {result}", fg=typer.colors.RED, err=True)
-            failed += 1
-            continue
-        reported = {o.id for o in result.results}
-        for outcome in result.results:
-            target = by_id.get(outcome.id)
-            if target is None:
-                typer.secho(f"  {file}: fix agent reported unknown finding id {outcome.id}",
-                            fg=typer.colors.YELLOW, err=True)
-                continue
-            if outcome.outcome == "fixed":
-                target.status = "fixed"
-                target.log(n, "fix", detail=outcome.detail)
-                fixed += 1
-            else:
-                target.status = "disputed"
-                target.adjudicated = False
-                target.log(n, "dispute", detail=outcome.detail)
-                disputed += 1
-        for missing in {f.id for f in groups[file]} - reported:
-            typer.secho(f"  {file}: fix agent did not report on {missing}",
-                        fg=typer.colors.YELLOW, err=True)
+
+    rejected = _unproven_sources(paths, profile, outcomes, by_id)
+    counts = _record_outcomes(outcomes, groups, by_id, rejected, n)
 
     store.save_findings(paths, findings)
     store.rebuild_index(paths, profile, findings)
-    typer.echo(f"fixed {fixed}, disputed {disputed}, failed files {failed}")
-    if failed:
+    summary = (f"fixed {counts['fixed']}, disputed {counts['disputed']}, "
+               f"failed files {counts['failed']}")
+    if counts["unproven"]:
+        summary += f", unproven {counts['unproven']} (paired tests fail; left open)"
+    typer.echo(summary)
+    if counts["failed"]:
         raise typer.Exit(1)
 
 

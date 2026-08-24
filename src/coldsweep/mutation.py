@@ -349,6 +349,47 @@ class MutationCache:
         self.con.close()
 
 
+def run_tests(repo: Path, config: MutationConfig, tests: list[str],
+              timeout_s: int) -> tuple[int, str]:
+    """Run the configured test command over `tests`. Returns (exit code, tail of the output)."""
+    command = config.test_command.replace("{tests}", " ".join(tests))
+    # Never let a run leave bytecode behind for the next one to import.
+    env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
+    try:
+        proc = subprocess.run(command, cwd=repo, shell=True, capture_output=True,
+                              text=True, timeout=timeout_s, check=False, env=env)
+    except subprocess.TimeoutExpired:
+        return (-1, "timed out")
+    return (proc.returncode, (proc.stdout + proc.stderr)[-400:])
+
+
+def reject_failing_fixes(repo: Path, profile: Profile, sources: list[str]) -> dict[str, str]:
+    """Run the tests paired with each source a fix claimed to resolve; report the red ones.
+
+    A profile with a ``mutation:`` block states its remedy as a test, so ``fixed`` cannot be
+    taken on the fix agent's word: a test that does not pass proves nothing about the symbol it
+    names. Without this the failure surfaces a round later, as the mutation baseline refusing
+    to run against a red suite -- by which point the findings are already recorded as fixed and
+    the round that recorded them has been paid for.
+
+    Keyed by source file, because that is the unit the pairing is defined over. A source whose
+    pattern matches no test file is not checked: nothing was claimed about a test that does not
+    exist.
+    """
+    if profile.mutation is None:
+        return {}
+    config = profile.mutation
+    failed: dict[str, str] = {}
+    for source in sorted(set(sources)):
+        tests = paired_tests(repo, source, config.test_patterns)
+        if not tests:
+            continue
+        code, detail = run_tests(repo, config, tests, config.baseline_timeout_s)
+        if code != 0:
+            failed[source] = detail
+    return failed
+
+
 def restore_interrupted(repo: Path, lock_path: Path) -> list[str]:
     """Put back the file an interrupted mutation run left swapped out.
 
@@ -421,15 +462,7 @@ class MutationRunner:
                 self.lock_path.unlink(missing_ok=True)
 
     def _run_tests(self, tests: list[str], timeout_s: int) -> tuple[int, str]:
-        command = self.config.test_command.replace("{tests}", " ".join(tests))
-        # Never let a mutation run leave bytecode behind for the next one to import.
-        env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
-        try:
-            proc = subprocess.run(command, cwd=self.repo, shell=True, capture_output=True,
-                                  text=True, timeout=timeout_s, check=False, env=env)
-        except subprocess.TimeoutExpired:
-            return (-1, "timed out")
-        return (proc.returncode, (proc.stdout + proc.stderr)[-400:])
+        return run_tests(self.repo, self.config, tests, timeout_s)
 
     def shard_key(self, shard: MutationShard) -> tuple[str, str, str, str]:
         """Everything that could change any verdict about this shard."""
