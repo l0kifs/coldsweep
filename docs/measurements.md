@@ -158,6 +158,57 @@ The loop implemented the spec: `runner.py::extract_usage`, `merge.py::_round_cos
 behaviours. That code is gone — it lived in a worktree under the agent scratchpad and was never
 committed, so the wipe took it with everything else. Only the diffstat above survives.
 
+### `features`, re-run after the verification fix — 3 rounds, $26.73
+
+Repeated against `fabd20f` with the same `SPEC.md`, the same profile and the same
+`max_rounds=4`, once `verify` could decide the rules a subsystem owns (defect 2 below).
+
+| Round | Spec impl/unimpl | Agent raw | New | Fixed | Verified | Deferred | USD |
+|---|---|---|---|---|---|---|---|
+| 1 | 0 / 6 | 2 | 8 | 7 (1 disputed) | **6** | 1 | 18.27 |
+| 2 | 6 / 0 | 0 | 0 | — nothing open | 0 | 1 | ~5 |
+| 3 | 6 / 0 | 0 | 0 | — nothing open | 0 | 0 | ~4 |
+
+```
+stopping after 3 round(s): 1 finding(s) need triage, and no further round can clear them
+  - 1 disputed finding(s) not adjudicated
+  disputed=1  lapsed=1  verified=6
+```
+
+| | Original | Re-run |
+|---|---|---|
+| Rounds | 4 (hard stop) | 3 (early stop: only triage left) |
+| Cost | $34.31 | $26.73 |
+| verified / lapsed | 0 / 8 | **6 / 1** |
+| Evidence-backed closure | 0% | **75%** |
+
+All six spec findings closed on evidence **in round 1**, not a round later — `verify` runs
+straight after `fix` and sees the markers the fix just wrote. The one remaining deferral is the
+`vacuous-implementation` agent finding, correctly deferred: nothing deterministic decides it.
+
+Two other behaviours showed up for the first time here, both of them correct:
+
+- **The early stop fired.** Round 3 ended the run rather than buying a fourth round that could
+  not have changed the outcome, because the only thing left was an unadjudicated dispute.
+- **The dispute was right.** A scan agent reported `runner.py::unwrap_envelope` for dropping
+  usage; the fix agent replied that `unwrap_envelope` is text-only by design and `call()`
+  separately runs `extract_usage(raw)` on the same envelope. That is true of the code the loop
+  had just written — the finding was anchored on the wrong symbol.
+
+`coldsweep adjudicate --accept-disputes` then closed the triage, and:
+
+```
+$ coldsweep converged --task bench-features; echo $?
+0
+```
+
+**This is the only task in this document whose gate opened.** It needed a working verification
+path for its deterministic rules, and one human decision on one dispute.
+
+The implementation the loop produced — a `Usage` model, `runner.extract_usage`, per-round cost
+in the round record, spend in `coldsweep status` — is committed on branch `bench/features2` as
+`de112f3`. Unreviewed, and kept as evidence rather than offered as a patch.
+
 ### `tests` — 13 shards, 1 round, $80.48
 
 Round 2 never scanned. The loop stopped itself:
@@ -242,7 +293,7 @@ Lumping `docs` in with `issues` as "budget-bounded" is not supported by the data
 |---|---|---|---|
 | `issues` | 52 | 1 | 98% |
 | `docs` | 3 | 9 | 25% |
-| `features` | 0 | 8 | **0%** |
+| `features` | 0 | 8 | **0%** — 75% after the fix below |
 | `tests` | 0 | 0 | **0%** — 114 still deferred at the stop |
 
 `issues` is `absence` mode with anchors inside its own scope, so `coldsweep verify` can re-read
@@ -277,8 +328,8 @@ Items 2, 3 and 4 are fixed; the rest stand.
    **Fixed** — a rule a deterministic subsystem owns does not need a snippet, since the sweep
    that produced the finding is exhaustive over scope. `spec.implemented_items` re-derives the
    marker set and `verify` decides on it: marked → `verified`, unmarked → `reopen`, with the
-   same oscillation guard as the snippet path. The `features` task's 6 spec findings would have
-   closed on evidence instead of all 8 lapsing.
+   same oscillation guard as the snippet path. Confirmed by re-running the task: 6 verified
+   instead of 0, in one round fewer and for $7.58 less, and its gate opened.
 3. ~~**`docs.yaml`'s header comment contradicts the measurement.**~~ It claimed a plateau; the
    measured curve decays 8 → 6 → 2 → 1. **Fixed** — the template and the README now state the
    difference between the two budget-bounded profiles.
