@@ -135,11 +135,20 @@ consecutive scans simply stopped re-deriving is `lapsed` — closed, but nothing
 repository to close it. `coldsweep status` counts them separately, so a green run shows how
 much of its green came from evidence.
 
-Verification searches the anchor's file, not the whole repository. Repo-wide matching cannot
-tell a fix from an unrelated file that happens to contain the same snippet, so one surviving
-instance of a common idiom would reopen every finding under its rule. Code moved instead of
-fixed is caught by the next round re-deriving it at its new anchor. An anchor outside scope, or
-in a file that cannot be read, is deferred — never verified.
+Verification searches the anchored symbol, falling back to its file when the anchor names no
+symbol. Searching wider cannot tell a fix from an unrelated copy of the same snippet, and a
+common idiom appearing twice in one module would otherwise let the untouched copy reopen a
+finding about the fixed one — measured on this repository, 7.4% of snippets recur inside their
+own file. Code moved instead of fixed is caught by the next round re-deriving it at its new
+anchor. An anchor outside scope, or in a file that cannot be read, is deferred — never verified.
+
+A surviving snippet is not proof that a fix failed. Whole classes of remedy are **additive** —
+handling wrapped around a call, validation added after a read — and leave the cited line exactly
+where it was; in the `issues` taxonomy those rules were 69 of 85 findings. So a snippet that is
+still present reopens the finding only when the symbol around it is unchanged too. If the symbol
+changed, the two cases are indistinguishable from the text and the finding is deferred to the
+next round's fresh derivation. That removes a false failure without inventing a proof: an
+additive fix closes by lapsing, not by evidence.
 
 That path needs an offending snippet to look for, so it can only decide `absence` findings. A
 rule a deterministic subsystem owns does not need one: the sweep that produced the finding is

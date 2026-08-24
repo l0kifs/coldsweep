@@ -91,6 +91,14 @@ class Finding(BaseModel):
     adjudicated: bool = False
     first_seen_round: int = 0
     last_seen_round: int = 0
+    pre_fix_sha: str | None = None
+    """The anchored symbol as it stood when a fix agent was sent to it.
+
+    Verification needs it to tell two cases apart that look identical from the text alone: a
+    remedy that *adds* code around the cited line, which leaves the line in place, and an agent
+    that did nothing at all. ``None`` means nobody recorded a baseline -- a finding fixed before
+    this existed -- and is treated as "cannot tell it changed".
+    """
     reopen_baseline: int = 0
     """Reopens triage has already ruled on.
 

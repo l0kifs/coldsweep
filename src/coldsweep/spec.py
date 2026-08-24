@@ -136,6 +136,23 @@ def symbol_ranges(source: str) -> list[tuple[int, int, str]]:
     return ranges
 
 
+def symbol_text(source: str, anchor: str) -> str | None:
+    """The source of the symbol an anchor names, or ``None`` when it cannot be located.
+
+    ``None`` is the answer for a module-level anchor, a renamed or deleted symbol, and a file
+    that no longer parses. Every caller treats it as "cannot tell" rather than as an empty
+    symbol, because the three cases are indistinguishable here and none of them is evidence.
+    """
+    path = anchor.split("::", 1)[1] if "::" in anchor else ""
+    if not path:
+        return None
+    lines = source.splitlines()
+    for start, end, symbol in symbol_ranges(source):
+        if symbol == path:
+            return "\n".join(lines[start - 1:end])
+    return None
+
+
 def anchor_for(file: str, source: str, lineno: int) -> str:
     """The innermost symbol containing a line, as a stable anchor. Never a line number."""
     best_start, best_path = -1, ""

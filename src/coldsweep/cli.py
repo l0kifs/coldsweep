@@ -26,6 +26,7 @@ from .models import (
     Shard,
     ShardResult,
     SpendRecord,
+    evidence_sha,
 )
 from .runner import AgentError, Runner, fix_lanes
 from .shard import (
@@ -460,6 +461,25 @@ def ingest(
                     f"-- run `coldsweep adjudicate`", fg=typer.colors.YELLOW)
 
 
+def _snapshot_symbols(paths: Paths, todo: list[Finding]) -> None:
+    """Record each anchored symbol as it stands *before* the agents run.
+
+    Verification compares against this to tell an additive remedy -- handling wrapped around
+    the cited line, which leaves the line in place -- from an agent that changed nothing. Taken
+    here because this is the last moment the pre-fix state exists.
+    """
+    sources: dict[str, str | None] = {}
+    for finding in todo:
+        if finding.file not in sources:
+            try:
+                sources[finding.file] = (paths.repo / finding.file).read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                sources[finding.file] = None
+        source = sources[finding.file]
+        body = spec_mod.symbol_text(source, finding.anchor) if source is not None else None
+        finding.pre_fix_sha = evidence_sha(body) if body is not None else None
+
+
 def _editable_slices(paths: Paths, profile: Profile,
                      groups: dict[str, list[Finding]]) -> dict[str, list[str]]:
     """Which files each fix group may write, and therefore which groups can run together."""
@@ -561,6 +581,7 @@ def fix(
                f"with model {profile.models.fix}")
 
     by_id = {f.id: f for f in findings}
+    _snapshot_symbols(paths, todo)
     slices = _editable_slices(paths, profile, groups) if profile.fix_scope == "task" else None
     outcomes = asyncio.run(_runner(paths, profile, n).fix(groups, slices))
 

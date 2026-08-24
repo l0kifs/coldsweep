@@ -314,7 +314,7 @@ enumeration quality — multiplies this floor directly.
 
 ## Defects this run surfaced
 
-Items 1 through 6 are fixed; 7 and 8 stand.
+Items 1 through 6 and 8 are fixed; 7 stands.
 
 1. ~~**`runner.py` discards the cost envelope.**~~ `unwrap_envelope` returned only `result`, so
    everything in this document had to be captured by wrapping the `claude` binary. **Fixed** —
@@ -384,8 +384,27 @@ Items 1 through 6 are fixed; 7 and 8 stand.
    spend line.
 7. **The dispute backlog is unbounded and blocks the gate.** `issues` ended with 24 disputed
    findings after 4 rounds, growing every round, with no automatic adjudication in `run`.
-8. **~40% of fixes do not survive verification** on `issues`, and the loop's only response is
-   to spend another round.
+8. ~~**~40% of fixes do not survive verification**~~ on `issues` — 37 of 89 reopened. Two
+   causes, both measured, neither of them the agent failing:
+
+   - The predicate searched the whole file. 7.4% of snippets in this repository recur inside
+     their own file, so an untouched copy could reopen a finding about a fixed one.
+   - **The bigger one: the `absence` predicate is wrong for an additive remedy.** Wrapping a
+     call in `try/except`, or adding validation after a read, leaves the cited line exactly
+     where it was. Demonstrated directly — a textbook fix for `missing-error-handling` and for
+     `unvalidated-external-input` both still match their own evidence, and those two rules were
+     **69 of the 85 findings** in that run. `swallowed-exception` and `resource-leak` rewrite
+     the cited line and verify correctly.
+
+   **Fixed** — the search is scoped to the anchored symbol, and a surviving snippet reopens a
+   finding only when the symbol around it is unchanged. When the symbol changed, the case is
+   deferred rather than reopened.
+
+   Note what this does not do: it removes a false failure, it does not manufacture a proof. An
+   additive fix now closes by lapsing rather than by evidence, so `issues` should show fewer
+   reopens *and* a lower evidence-backed closure rate. Proving an additive remedy needs a
+   predicate that asks whether the cited line is now guarded, which is rule-specific AST work
+   and is not done here.
 
 ## Limits of this measurement
 

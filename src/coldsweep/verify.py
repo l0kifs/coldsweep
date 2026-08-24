@@ -4,15 +4,19 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .models import Finding, Profile, normalize_snippet
+from .models import Finding, Profile, evidence_sha, normalize_snippet
 from .shard import governed_files
-from .spec import implemented_items
+from .spec import implemented_items, symbol_text
 
 
-def _normalized_file(repo: Path, rel: str) -> str | None:
-    """One file's normalized text, or ``None`` when it cannot be read."""
+def _read(repo: Path, rel: str) -> str | None:
+    """One file's source, or ``None`` when it cannot be read.
+
+    Raw, not normalized: the anchored symbol has to be located by parsing it first, and
+    normalization is applied to whichever region that lookup settles on.
+    """
     try:
-        return normalize_snippet((repo / rel).read_text(encoding="utf-8"))
+        return (repo / rel).read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
         return None
 
@@ -57,9 +61,16 @@ def verify_findings(repo: Path, profile: Profile, findings: list[Finding], round
 
     Decides two kinds of finding. ``absence`` findings that carry evidence *and* whose anchor
     names a readable file the profile governs -- audited or editable -- are decided by looking
-    for the offending snippet. ``unimplemented-spec-item`` findings are decided by re-deriving
-    the marker set, which is exhaustive over scope and costs one regex pass; they are anchored
-    in the spec document and carry no snippet, so the snippet path can never decide them.
+    for the offending snippet, inside the anchored symbol where one can be located and in the
+    whole file otherwise. ``unimplemented-spec-item`` findings are decided by re-deriving the
+    marker set, which is exhaustive over scope and costs one regex pass; they are anchored in
+    the spec document and carry no snippet, so the snippet path can never decide them.
+
+    A surviving snippet is not by itself proof that a fix failed. Whole classes of remedy are
+    additive -- handling wrapped around a call, validation added after a read -- and leave the
+    cited line exactly where it was. So a snippet that is still present reopens the finding only
+    when the symbol around it is also unchanged; if the symbol moved, the two cases cannot be
+    told apart here and the finding is deferred to the next round's fresh derivation.
 
     Everything else is deferred: a claim that cannot be checked is never upgraded to a
     confirmation, and is resolved instead by a later round failing to re-derive the finding.
@@ -78,7 +89,7 @@ def verify_findings(repo: Path, profile: Profile, findings: list[Finding], round
     # Re-derived once for the whole pass, not per finding: the sweep is over all of scope.
     spec_rule = profile.spec.unimplemented_rule_id if profile.spec else None
     implemented = implemented_items(repo, profile) if spec_rule else set()
-    texts: dict[str, str | None] = {}
+    sources: dict[str, str | None] = {}
     for f in candidates:
         if spec_rule and f.rule_id == spec_rule:
             item = _spec_item_of(f)
@@ -93,14 +104,22 @@ def verify_findings(repo: Path, profile: Profile, findings: list[Finding], round
         if f.file not in governed:
             _defer(stats, f, round_no, f"{f.file} is outside the profile scope")
             continue
-        if f.file not in texts:
-            texts[f.file] = _normalized_file(repo, f.file)
-        text = texts[f.file]
-        if text is None:
+        if f.file not in sources:
+            sources[f.file] = _read(repo, f.file)
+        source = sources[f.file]
+        if source is None:
             _defer(stats, f, round_no, f"{f.file} could not be read")
             continue
-        if evidence_present(text, f.evidence):
-            _reopen(stats, f, round_no, f"evidence still present in {f.file}")
+        # The anchored symbol, not the whole file: the same idiom several times over in one
+        # module would otherwise let an untouched copy reopen a finding about a fixed one.
+        body = symbol_text(source, f.anchor)
+        where = f.anchor if body is not None else f.file
+        if not evidence_present(normalize_snippet(body if body is not None else source), f.evidence):
+            _verified(stats, f, round_no, f"evidence absent from {where}")
+        elif body is not None and f.pre_fix_sha and evidence_sha(body) != f.pre_fix_sha:
+            _defer(stats, f, round_no,
+                   f"{where} changed but the cited snippet is still there, which is what an "
+                   f"additive remedy looks like")
         else:
-            _verified(stats, f, round_no, f"evidence absent from {f.file}")
+            _reopen(stats, f, round_no, f"evidence still present in {where}, unchanged")
     return stats
