@@ -1,7 +1,9 @@
 # Convergence and cost, measured end to end
 
 Measured 2026-08-24 against `d31287f`, one real `coldsweep run` per profile type, fix phase
-enabled, on this repository.
+enabled, on this repository. Every defect it found was then fixed and three of the four types
+were measured again at `24ab2fb` — see [Run 2](#run-2--the-same-measurement-against-the-repaired-tool).
+Everything before that section describes the tool as it was, not as it is.
 
 ## What existed before this
 
@@ -273,6 +275,82 @@ remedy is *writing tests*, the fix phase has no success predicate at all: an age
 `fixed`, the finding is marked fixed, and whether the test it wrote even passes is discovered
 one round later by a subsystem that exists for a different purpose. 114 findings were marked
 fixed on nothing but the agent's own say-so.
+
+## Run 2 — the same measurement against the repaired tool
+
+Everything above describes `d31287f`. All eight defects it found were then fixed, and three of
+the four types were measured again at `24ab2fb` with the same configuration: `max_rounds=4`,
+`k=2`, `files_per_shard=1`, `parallelism=4`, sonnet, no `scan_alt`, the same 6-item `SPEC.md`,
+and the same shard counts (15 / 2 / 15). `tests` was not re-run — at four rounds it costs more
+than the other three together.
+
+`max_disputes` was deliberately left unset, though it is one of the fixes: setting it would
+have stopped `issues` early and destroyed round-for-round comparability.
+
+| | `issues` | | `docs` | | `features` | |
+|---|---|---|---|---|---|---|
+| | run 1 | run 2 | run 1 | run 2 | run 1 | run 2 |
+| New per round | 31,22,17,15 | 29,17,20,12 | 8,6,2,1 | 9,3,2,1 | 8,1,2,0 | 6,1,1,1 |
+| Fixes claimed | 89 | 76 | 17 | 15 | 9 | 9 |
+| **Reopened by verify** | **37** | **0** | 0 | 0 | 0 | 0 |
+| verified / lapsed | 52 / 1 | 49 / 12 | 3 / 9 | 3 / 5 | 0 / 8 | **6 / 1** |
+| Evidence-backed closure | 98% | 80% | 25% | 38% | **0%** | **86%** |
+| Disputes at the end | 24 | **3** | 2 | 6 | 1 | 0 |
+| Cost | $44.99 | $46.47 | $15.91 | $18.13 | $34.31 | $30.68 |
+
+Three types, both runs: **$95.21 → $95.28**. Seven behaviour changes for a 0.07% difference in
+price.
+
+### What changed
+
+**Verification stopped reporting correct fixes as failed.** `issues` went from 37 reopens in 89
+fixes to **zero in 76**. That is the single largest behavioural difference in this document, and
+it is the one whose mechanism was already established in isolation: the two additive-remedy
+rules were 69 of 85 findings, and their correct fixes leave the cited line in place.
+
+**Evidence-backed closure moved in both directions, as designed.** `issues` fell 98% → 80%:
+false failures became honest defers, and a deferred fix closes by lapsing rather than by proof.
+`features` went 0% → 86% in the other direction, because a rule a subsystem decides can now be
+verified by re-deriving it. Both are the same principle — claim only what was checked — and the
+fact that it lowers one number and raises another is the point.
+
+**The dispute backlog collapsed, 24 → 3, and that was not predicted.** It is a second-order
+effect of the verification fix: in run 1 a wrongly-reopened finding went back to `open`, was
+fixed again, and eventually the fix agent refused and disputed it. Most of that backlog was the
+tool arguing with itself. `docs` went the other way, 2 → 6, on a corpus its own earlier rounds
+had rewritten.
+
+**Adjudication became visible.** `issues` run 1 reported `adjudicated 0` while spending $1.03
+across 6 calls; run 2 reports `adjudicated 0 of 4 call(s)` and $2.97 across 12.
+
+### What did not change
+
+**Convergence.** `issues` still contributed 12 new findings in round 4; `features` still drew
+one `vacuous-implementation` finding per round to the end. None of the eight fixes was aimed at
+the enumeration floor, and none moved it. Every gate that was shut is still shut.
+
+**The cost shape.** Cache creation is 48–64% of every bill in both runs, and recomputing run 2
+from token counts at Sonnet 5 rates reproduces all three totals to within 0.3%, exactly as it
+did for run 1.
+
+**`docs` decays rather than plateaus.** 8,6,2,1 then 9,3,2,1 — the claim the original
+`docs.yaml` got wrong, now measured twice.
+
+### What this comparison cannot tell you
+
+Run 2 is not a controlled A/B. The tool changed **and so did the corpus it audits**: seven
+commits added roughly 700 lines to `src/`, and `README.md` was substantially rewritten between
+the runs. So the per-round finding counts are not strictly comparable — a difference there
+could be the repair or could be the new code.
+
+The claims that survive that objection are the ones with an independent mechanism: reopens
+(the predicate was demonstrated wrong in isolation), evidence-backed closure (same), dispute
+visibility, and the cost model. The convergence curves are weaker evidence, and `n` is still 1
+per type per commit.
+
+`tests` is missing from run 2 entirely, so the two fixes built specifically for it — the
+fix-phase gate and the concurrent-write lanes — have unit-level reproductions behind them and no
+end-to-end measurement.
 
 ## What this measurement says
 
@@ -727,6 +805,19 @@ That is the whole defect in one line.
 
 Run `run.sh 1` first: it is the control, and all four tests must survive it. If they do not, the
 stub or the seed is wrong, not the tool.
+
+## What each run left behind
+
+Every worktree is committed to its own branch rather than deleted, because the first session's
+output was lost when its worktree went away unreviewed:
+
+| Branch | What |
+|---|---|
+| `bench/tests` | run 1 `tests`, round 1 only — 1207 lines of tests, 4 of them failing |
+| `bench/features2` | the loop's own cost-accounting implementation, superseded by the hand-written one |
+| `bench2/issues`, `bench2/docs`, `bench2/features` | run 2, four rounds each, with `.coldsweep/` state and spend ledgers |
+
+All unreviewed agent output. Read before reusing.
 
 ## Cleaning up
 
