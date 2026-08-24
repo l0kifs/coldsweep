@@ -155,7 +155,8 @@ unadjudicated dispute.
 
 The loop implemented the spec: `runner.py::extract_usage`, `merge.py::_round_cost`,
 `cli.py::status` and a `Usage` model, plus `# spec: FR-n` markers on the three pre-existing
-behaviours. That work exists on branch `bench/features`, unreviewed.
+behaviours. That code is gone — it lived in a worktree under the agent scratchpad and was never
+committed, so the wipe took it with everything else. Only the diffstat above survives.
 
 ### `tests` — 13 shards, 1 round, $80.48
 
