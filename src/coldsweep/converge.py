@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Iterable
+from dataclasses import dataclass
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .models import Finding, Profile
+from .models import Finding, Profile, SpendRecord
 
 
 class ConvergenceReport(BaseModel):
@@ -141,3 +143,59 @@ def status_counts(findings: list[Finding]) -> dict[str, Counter]:
     by_rule: Counter = Counter(f.rule_id for f in findings)
     by_source: Counter = Counter(f.source for f in findings)
     return {"status": by_status, "rule": by_rule, "source": by_source}
+
+
+@dataclass(frozen=True)
+class Spend:  # pylint: disable=too-many-instance-attributes
+    """What a task has spent, aggregated from its ledger.
+
+    Every token class is carried separately rather than pre-summed: measured on this
+    repository, cache traffic is the majority of the bill, so a caller reading only input and
+    output would draw the wrong conclusion about where the money goes.
+
+    ``unmeasured`` is reported rather than folded in: an agent command that emits no envelope
+    produces real cost and no record of it, and a total that quietly excluded those calls would
+    read as complete when it is a lower bound.
+    """
+
+    calls: int = 0
+    unmeasured: int = 0
+    failed: int = 0
+    cost_usd: float = 0.0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_creation_tokens: int = 0
+    cache_read_tokens: int = 0
+
+    @property
+    def tokens(self) -> int:
+        return (self.input_tokens + self.output_tokens
+                + self.cache_creation_tokens + self.cache_read_tokens)
+
+    @property
+    def complete(self) -> bool:
+        """Whether every call in this bucket reported what it cost."""
+        return self.unmeasured == 0
+
+
+def tally(records: Iterable[SpendRecord]) -> Spend:
+    totals = dict.fromkeys(
+        ("cost_usd", "input_tokens", "output_tokens", "cache_creation_tokens", "cache_read_tokens"), 0.0)
+    calls = unmeasured = failed = 0
+    for record in records:
+        calls += 1
+        failed += not record.ok
+        unmeasured += not record.usage.measured
+        for field in totals:
+            totals[field] += getattr(record.usage, field) or 0
+    return Spend(calls=calls, unmeasured=unmeasured, failed=failed,
+                 cost_usd=round(totals["cost_usd"], 4),
+                 **{k: int(v) for k, v in totals.items() if k != "cost_usd"})
+
+
+def spend_by(records: Iterable[SpendRecord], key: str) -> dict[str, Spend]:
+    """Tally grouped by one field of the record -- ``phase``, ``model`` or ``round``."""
+    buckets: dict[str, list[SpendRecord]] = {}
+    for record in records:
+        buckets.setdefault(str(getattr(record, key)), []).append(record)
+    return {k: tally(v) for k, v in sorted(buckets.items())}

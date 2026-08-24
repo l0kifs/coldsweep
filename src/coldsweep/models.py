@@ -176,6 +176,59 @@ class ScanResult(BaseModel):
     findings: list[RawFinding] = Field(default_factory=list)
 
 
+class Usage(BaseModel):
+    """What one agent subprocess cost, read off its result envelope.
+
+    Every field is independently optional, and ``None`` is not zero. An agent command that
+    emits no envelope -- a stub, a wrapper, anything that is not the configured CLI -- leaves
+    them all unset, and "nobody measured this call" must stay distinguishable from "this call
+    was free". Aggregation counts the unmeasured rather than adding them in as zeros.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    cache_creation_tokens: int | None = None
+    cache_read_tokens: int | None = None
+    cost_usd: float | None = None
+    duration_ms: float | None = None
+
+    @property
+    def measured(self) -> bool:
+        """Whether the envelope reported anything at all about this call."""
+        return any(v is not None for v in self.model_dump().values())
+
+    @property
+    def tokens(self) -> int | None:
+        """Every token the call was billed for, cache included.
+
+        Cache traffic is not a footnote: measured on this repository it is the majority of the
+        bill, so a token total that counted only input and output would understate a scan by
+        roughly four times.
+        """
+        parts = [self.input_tokens, self.output_tokens,
+                 self.cache_creation_tokens, self.cache_read_tokens]
+        return sum(p for p in parts if p is not None) if any(p is not None for p in parts) else None
+
+
+class SpendRecord(BaseModel):
+    """One agent subprocess, and what it cost. Appended to ``spend.jsonl``.
+
+    Per *attempt*, not per successful call: a retry is another subprocess and another bill, and
+    a phase that fails after three attempts is the most expensive kind of round there is.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    round: int
+    phase: str
+    model: str = ""
+    attempt: int = 1
+    ok: bool = True
+    usage: Usage = Field(default_factory=Usage)
+
+
 class ShardResult(BaseModel):
     """One shard's scan outcome, raw. Persisted to ``.coldsweep/runs/<round>.json``."""
 
@@ -189,6 +242,9 @@ class ShardResult(BaseModel):
     model: str = ""
     source: Source = "agent"
     findings: list[RawFinding] = Field(default_factory=list)
+    usage: Usage = Field(default_factory=Usage)
+    """What this shard's agent call cost. All-``None`` for a mechanical shard, which spawns no
+    agent, and for a shard whose agent never returned an envelope."""
 
 
 class ScanRound(BaseModel):

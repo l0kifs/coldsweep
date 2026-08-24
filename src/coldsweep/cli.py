@@ -6,6 +6,7 @@ import asyncio
 import json
 import shutil
 import sys
+from dataclasses import asdict
 from pathlib import Path
 from typing import Annotated
 
@@ -24,6 +25,7 @@ from .models import (
     ScanRound,
     Shard,
     ShardResult,
+    SpendRecord,
 )
 from .runner import AgentError, Runner
 from .shard import ShardError, build_shards, resolve_editable, shard_warnings
@@ -80,6 +82,12 @@ def _evaluate(paths: Paths, profile: Profile, findings: list[Finding]) -> conver
                              _blockers(paths, profile), store.incomplete_rounds(paths))
 
 
+def _runner(paths: Paths, profile: Profile, round_no: int) -> Runner:
+    """Every Runner the CLI builds bills to the task's ledger. There is no unbilled path."""
+    return Runner(paths.repo, profile, ledger=lambda r: store.append_spend(paths, r),
+                  round_no=round_no)
+
+
 def _fail(message: str, code: int = 2) -> None:
     typer.secho(f"error: {message}", fg=typer.colors.RED, err=True)
     raise typer.Exit(code)
@@ -109,8 +117,9 @@ def init(
 
     paths.runs.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(source, paths.profile)
-    if not paths.findings.exists():
-        paths.findings.write_text("", encoding="utf-8")
+    for committed in (paths.findings, paths.spend):
+        if not committed.exists():
+            committed.write_text("", encoding="utf-8")
     (paths.container / ".gitignore").write_text(
         "tasks/*/index.sqlite\ntasks/*/mutants.sqlite\ntasks/*/mutants.lock\n", encoding="utf-8")
     store.load_profile(paths)
@@ -243,7 +252,7 @@ def scan(
     if mech_count:
         typer.echo(f"round {n}: deterministic checks produced {mech_count} finding(s)")
 
-    runner = Runner(paths.repo, profile)
+    runner = _runner(paths, profile, n)
     typer.echo(f"round {n}: scanning {len(shards)} shard(s) with model "
                f"{runner.scan_phase(n).model} (parallelism {profile.agent.parallelism})")
     results: list[ShardResult] = asyncio.run(runner.scan(shards, n))
@@ -424,7 +433,7 @@ def ingest(
         _fail(f"round {scan_round.round} has {len(scan_round.failed_shards)} failed shard(s); "
               f"coverage is incomplete. Re-run `coldsweep scan --round {scan_round.round}` or pass --force.")
 
-    adjudicator = None if no_llm else Runner(paths.repo, profile).adjudicator()
+    adjudicator = None if no_llm else _runner(paths, profile, scan_round.round).adjudicator()
     findings, record = merge.merge_round(findings, scan_round, profile, scan_round.round, adjudicator)
     store.save_findings(paths, findings)
     store.save_run_record(paths, record)
@@ -529,7 +538,7 @@ def fix(
 
     by_id = {f.id: f for f in findings}
     editable = resolve_editable(paths.repo, profile) if profile.fix_scope == "task" else None
-    outcomes = asyncio.run(Runner(paths.repo, profile).fix(groups, editable))
+    outcomes = asyncio.run(_runner(paths, profile, n).fix(groups, editable))
 
     rejected = _unproven_sources(paths, profile, outcomes, by_id)
     counts = _record_outcomes(outcomes, groups, by_id, rejected, n)
@@ -560,6 +569,34 @@ def verify_cmd(
                f"deferred to next round {stats['deferred']}")
 
 
+def _report_spend(records: list[SpendRecord], total: converge.Spend) -> None:
+    """What the task has cost so far, and how much of that is actually known."""
+    if not total.calls:
+        return
+    typer.echo(f"\nspend over {total.calls} agent call(s)")
+    if total.unmeasured == total.calls:
+        # Printing $0.00 here would answer a question nobody can answer from this data.
+        typer.secho("  unmeasured  no call reported usage; this agent command emits no envelope",
+                    fg=typer.colors.YELLOW)
+        return
+    typer.echo(f"  cost       ${total.cost_usd:,.2f}")
+    typer.echo(f"  tokens     {total.tokens:,}  "
+               f"(in {total.input_tokens:,}  out {total.output_tokens:,}  "
+               f"cache write {total.cache_creation_tokens:,}  read {total.cache_read_tokens:,})")
+    by_phase = converge.spend_by(records, "phase")
+    typer.echo("  by phase   " + "  ".join(
+        f"{phase} ${s.cost_usd:,.2f} ({s.calls})" for phase, s in by_phase.items()))
+    by_round = converge.spend_by(records, "round")
+    typer.echo("  by round   " + "  ".join(
+        f"{rnd}: ${s.cost_usd:,.2f}" for rnd, s in sorted(by_round.items(), key=lambda kv: int(kv[0]))))
+    if total.failed:
+        typer.secho(f"  failed     {total.failed} call(s) were paid for and returned nothing usable",
+                    fg=typer.colors.YELLOW)
+    if not total.complete:
+        typer.secho(f"  unmeasured {total.unmeasured} call(s) returned no usage; "
+                    f"the totals above are a lower bound", fg=typer.colors.YELLOW)
+
+
 @app.command()
 def status(
     task: Annotated[str, _task_opt()],
@@ -572,6 +609,9 @@ def status(
     report = _evaluate(paths, profile, findings)
     counts = converge.status_counts(findings)
 
+    spend = store.load_spend(paths)
+    total = converge.tally(spend)
+
     if as_json:
         typer.echo(json.dumps({
             "profile": profile.name,
@@ -580,6 +620,11 @@ def status(
             "by_rule": dict(counts["rule"]),
             "by_source": dict(counts["source"]),
             "convergence": report.model_dump(),
+            "spend": {
+                "total": asdict(total),
+                "by_phase": {k: asdict(v) for k, v in converge.spend_by(spend, "phase").items()},
+                "by_round": {k: asdict(v) for k, v in converge.spend_by(spend, "round").items()},
+            },
         }, indent=2, sort_keys=True))
         return
 
@@ -600,6 +645,8 @@ def status(
         typer.secho(f"\ndisputed, not adjudicated ({len(report.disputed_pending_ids)})", fg=typer.colors.YELLOW)
         for f in sorted((f for f in findings if f.id in set(report.disputed_pending_ids)), key=lambda f: f.id):
             typer.echo(f"  {f.id:<40} {f.anchor}\n    {f.description}")
+
+    _report_spend(spend, total)
 
     counts_by_round = dict(report.new_per_round)
     typer.echo(f"\nnew findings per round: "

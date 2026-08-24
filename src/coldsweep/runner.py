@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import shlex
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TypeVar
@@ -21,6 +22,8 @@ from .models import (
     ScanResult,
     Shard,
     ShardResult,
+    SpendRecord,
+    Usage,
 )
 from .spec import spec_context
 
@@ -92,6 +95,39 @@ def unwrap_envelope(stdout: str) -> str:
     return stdout
 
 
+def extract_usage(stdout: str) -> Usage:
+    """Read what a call cost off its result envelope.
+
+    Every field is taken independently and left ``None`` when the envelope does not carry it,
+    so a bare response yields an all-``None`` ``Usage``. Zeros here would be a claim the tool
+    cannot support: an agent command that reports nothing is not an agent command that was free.
+    """
+    try:
+        payload = json.loads(stdout)
+    except json.JSONDecodeError:
+        return Usage()
+    if not isinstance(payload, dict):
+        return Usage()
+    counts = payload.get("usage")
+    counts = counts if isinstance(counts, dict) else {}
+
+    def number(value: object) -> float | None:
+        return float(value) if isinstance(value, int | float) and not isinstance(value, bool) else None
+
+    def count(key: str) -> int | None:
+        value = number(counts.get(key))
+        return int(value) if value is not None else None
+
+    return Usage(
+        input_tokens=count("input_tokens"),
+        output_tokens=count("output_tokens"),
+        cache_creation_tokens=count("cache_creation_input_tokens"),
+        cache_read_tokens=count("cache_read_input_tokens"),
+        cost_usd=number(payload.get("total_cost_usd")),
+        duration_ms=number(payload.get("duration_ms")),
+    )
+
+
 @dataclass(frozen=True)
 class Phase:
     name: str
@@ -114,11 +150,21 @@ def build_argv(cfg: AgentConfig, phase: Phase) -> list[str]:
 class Runner:
     """Owns every subprocess coldsweep spawns."""
 
-    def __init__(self, repo: Path, profile: Profile) -> None:
+    def __init__(self, repo: Path, profile: Profile,
+                 ledger: Callable[[SpendRecord], None] | None = None,
+                 round_no: int = 0) -> None:
         self.repo = repo
         self.profile = profile
         self.cfg = profile.agent
         self._sem = asyncio.Semaphore(self.cfg.parallelism)
+        self._ledger = ledger
+        self._round = round_no
+
+    def _record(self, phase: Phase, attempt: int, usage: Usage, ok: bool) -> None:
+        """Bill one subprocess. Every phase goes through here, so nothing spends unrecorded."""
+        if self._ledger is not None:
+            self._ledger(SpendRecord(round=self._round, phase=phase.name, model=phase.model,
+                                     attempt=attempt, ok=ok, usage=usage))
 
     def scan_phase(self, round_no: int) -> Phase:
         """Alternate to ``scan_alt`` on even rounds -- same-family agents share blind spots.
@@ -159,16 +205,33 @@ class Runner:
             raise AgentError(f"{phase.name} agent exited {proc.returncode}: {err.decode('utf-8', 'replace')[:400]}")
         return out.decode("utf-8", "replace")
 
-    async def call(self, phase: Phase, prompt: str, schema: type[T]) -> tuple[T, int]:
-        """Invoke an agent and enforce the schema. Retries on violation, then fails loudly."""
+    async def call(self, phase: Phase, prompt: str, schema: type[T]) -> tuple[T, int, Usage]:
+        """Invoke an agent and enforce the schema. Retries on violation, then fails loudly.
+
+        Each attempt is billed as it happens, whether or not it produced a usable answer. A
+        schema violation still ran a subprocess and still cost what it cost, and a phase that
+        exhausts its retries is the most expensive outcome there is -- so it is exactly the one
+        that must not be missing from the ledger.
+        """
         last: Exception | None = None
         for attempt in range(1, self.cfg.retries + 2):
             async with self._sem:
                 try:
                     raw = await self._exec(phase, prompt)
-                    return schema.model_validate(extract_json(unwrap_envelope(raw))), attempt
-                except (AgentError, ValidationError) as exc:
+                except AgentError as exc:
+                    # No envelope: the process died or never answered. Recorded as unmeasured.
+                    self._record(phase, attempt, Usage(), ok=False)
                     last = exc
+                    continue
+                usage = extract_usage(raw)
+                try:
+                    parsed = schema.model_validate(extract_json(unwrap_envelope(raw)))
+                except (AgentError, ValidationError) as exc:
+                    self._record(phase, attempt, usage, ok=False)
+                    last = exc
+                    continue
+                self._record(phase, attempt, usage, ok=True)
+                return parsed, attempt, usage
         raise AgentError(f"{phase.name} agent failed after {self.cfg.retries + 1} attempt(s): {last}")
 
     def context(self, files: list[str]) -> str:
@@ -188,12 +251,12 @@ class Runner:
             context=self.context(shard.files),
         )
         try:
-            result, attempts = await self.call(phase, prompt, ScanResult)
+            result, attempts, usage = await self.call(phase, prompt, ScanResult)
         except AgentError as exc:
             return ShardResult(shard=shard.id, files=shard.files, ok=False, error=str(exc),
                                attempts=self.cfg.retries + 1, model=phase.model)
         return ShardResult(shard=shard.id, files=shard.files, ok=True, attempts=attempts,
-                           model=phase.model, findings=result.findings)
+                           model=phase.model, findings=result.findings, usage=usage)
 
     async def scan(self, shards: list[Shard], round_no: int) -> list[ShardResult]:
         phase = self.scan_phase(round_no)
@@ -229,7 +292,7 @@ class Runner:
         prompt = render("fix.md", files="\n".join(f"- `{f}`" for f in files),
                         new_files=self._new_file_note(), rules=self._rules_block(),
                         findings=listing)
-        result, _ = await self.call(self.fix_phase(), prompt, FixResult)
+        result, _, _ = await self.call(self.fix_phase(), prompt, FixResult)
         return result
 
     async def fix(self, groups: dict[str, list[Finding]],
@@ -248,7 +311,7 @@ class Runner:
             a_rule=a.rule_id, a_anchor=a.anchor, a_description=a.description, a_evidence=a.evidence or "(none)",
             b_rule=b.rule_id, b_anchor=b.anchor, b_description=b.description, b_evidence=b.evidence or "(none)",
         )
-        result, _ = await self.call(self.adjudicate_phase(), prompt, Adjudication)
+        result, _, _ = await self.call(self.adjudicate_phase(), prompt, Adjudication)
         return result
 
     def adjudicator(self) -> Adjudicator:

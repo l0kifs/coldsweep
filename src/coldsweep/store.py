@@ -13,7 +13,7 @@ from pathlib import Path
 import yaml
 from pydantic import ValidationError
 
-from .models import Finding, Profile, Rule, RunRecord, ScanRound
+from .models import Finding, Profile, Rule, RunRecord, ScanRound, SpendRecord
 
 COLDSWEEP_DIR = ".coldsweep"
 TASKS_DIR = "tasks"
@@ -68,6 +68,15 @@ class Paths:
     def spec_lock(self) -> Path:
         """The freeze record. Committed: it is a decision, not a derived artefact."""
         return self.root / "spec.lock"
+
+    @property
+    def spend(self) -> Path:
+        """What this task's agent calls cost. Committed: an event log, not a derived index.
+
+        Nothing can rebuild it -- the subprocesses are gone and their envelopes with them -- so
+        it is source of truth in the same sense findings.jsonl is.
+        """
+        return self.root / "spend.jsonl"
 
     @property
     def mutants(self) -> Path:
@@ -237,6 +246,29 @@ def save_run_record(paths: Paths, record: RunRecord) -> Path:
     path = paths.ingest_file(record.round)
     atomic_write(path, json.dumps(record.model_dump(mode="json"), indent=2, sort_keys=True) + "\n")
     return path
+
+
+def append_spend(paths: Paths, record: SpendRecord) -> None:
+    """Append one agent call to the ledger. Append-only, one line, never rewritten."""
+    paths.root.mkdir(parents=True, exist_ok=True)
+    with paths.spend.open("a", encoding="utf-8") as fh:
+        fh.write(record.model_dump_json() + "\n")
+
+
+def load_spend(paths: Paths) -> list[SpendRecord]:
+    """Every recorded agent call. A malformed line is a hard error, like every other store."""
+    if not paths.spend.is_file():
+        return []
+    out: list[SpendRecord] = []
+    for lineno, line in enumerate(paths.spend.read_text(encoding="utf-8").splitlines(), start=1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(SpendRecord.model_validate_json(line))
+        except ValidationError as exc:
+            raise StoreError(f"{paths.spend}:{lineno}: {exc}") from exc
+    return out
 
 
 def completed_rounds(paths: Paths) -> list[int]:

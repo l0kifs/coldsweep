@@ -69,7 +69,7 @@ a previous task's history.
 | `coldsweep mutants` | Run the mutation subsystem alone and report unpinned symbols |
 | `coldsweep spec freeze` | Record what every spec item says right now |
 | `coldsweep spec status` | Every spec item, its freeze state, and what claims to implement it |
-| `coldsweep status [--json]` | Counts by status and rule; unclassified and disputed |
+| `coldsweep status [--json]` | Counts by status and rule; unclassified and disputed; what the task has spent |
 | `coldsweep converged` | Exit 0/1, no output |
 | `coldsweep adjudicate` | Triage disputed and unclassified findings |
 | `coldsweep run` | The full loop until converged or `max_rounds` |
@@ -87,6 +87,7 @@ Lives in the target repo, not here, and is scoped per task:
     harden-io/
       profile.yaml               # committed -- the taxonomy is the task statement
       findings.jsonl             # committed -- source of truth, one finding per line, by id
+      spend.jsonl                # committed -- one line per agent subprocess, and what it cost
       runs/<round>.json          # committed -- raw scan output
       runs/<round>.ingest.json   # committed -- merge audit record
       index.sqlite               # gitignored -- derived, rebuildable at any time
@@ -364,6 +365,31 @@ Output is a JSON list of `{anchor, evidence?, description?}` (or `{"findings": [
 is attributed to the configured `rule_id`. Whenever a rule becomes expressible as an AST
 pattern, move it here — agents should only handle the tail.
 
+## Cost
+
+Every agent subprocess is billed to the task's ledger, `spend.jsonl` — one line per *attempt*,
+because a retry is another subprocess and another bill, and a phase that exhausts its retries is
+the most expensive outcome there is. Scan, fix and adjudicate all go through it; there is no
+unbilled path.
+
+```
+$ coldsweep status --task harden-io
+spend over 102 agent call(s)
+  cost       $44.99
+  tokens     26,878,672  (in 1,151  out 742,423  cache write 4,535,822  read 21,599,276)
+  by phase   adjudicate $1.03 (6)  fix $16.19 (35)  scan $27.77 (61)
+  by round   1: $12.11  2: $11.78  3: $9.82  4: $11.29
+```
+
+Figures come from the agent command's own result envelope, never from a price table here, so
+they cannot drift as rates change. An agent command that emits no envelope — a stub, a wrapper —
+records `null`, not zero, and `status` says the totals are a lower bound rather than reporting a
+run as free. On a subscription account the envelope's USD is API-equivalent, not billed.
+
+Cache traffic is reported separately because it is where the money goes: a fresh subprocess per
+shard re-writes the prompt prefix into the cache every time, which is what makes the per-call
+floor roughly $0.08 before an agent reads anything, charged per shard per round.
+
 ## Stop hook
 
 Optional, for interactive sessions. A thin wrapper over `coldsweep converged` with no logic of
@@ -411,7 +437,9 @@ state the tool exists to remove.
   enumeration.
 - A features task inherits its spec's incompleteness silently: the loop checks that every
   frozen item is implemented, never that the set of items is complete.
-- Cost scales as rounds x shards.
+- Cost scales as rounds x shards, and a round that finds nothing still pays for a full scan.
+  `coldsweep status` reports what a task has actually spent; see
+  [docs/measurements.md](docs/measurements.md) for measured figures.
 
 ## Measurements
 
