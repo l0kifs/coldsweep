@@ -18,7 +18,12 @@ uv sync
 uv run coldsweep --help
 ```
 
-Requires Python 3.12+, `git`, and the `claude` CLI on PATH for the agent phases.
+Requires Python 3.12+, `git`, and the `claude` CLI on PATH for the agent phases. For a
+repository that is not Python, add the grammars — see [Languages](#languages):
+
+```sh
+uv add "coldsweep[languages]"
+```
 
 ## Quickstart
 
@@ -72,16 +77,17 @@ a previous task's history.
 | `coldsweep scan [--round N]` | Mechanical checks plus one full agent scan; writes `runs/<N>.json` |
 | `coldsweep ingest runs/<N>.json` | Validate, merge, update `findings.jsonl` |
 | `coldsweep fix [--rule R]` | Work open findings |
-| `coldsweep verify` | Re-check fixed findings against their evidence |
+| `coldsweep verify` | Re-check fixed findings against their evidence; re-runs a `mutation:` sweep when one is configured |
 | `coldsweep mutants` | Run the mutation subsystem alone and report unpinned symbols |
 | `coldsweep spec freeze` | Record what every spec item says right now |
 | `coldsweep spec status` | Every spec item, its freeze state, and what claims to implement it |
 | `coldsweep status [--json]` | Counts by status and rule; unclassified and disputed; what the task has spent |
-| `coldsweep converged` | Exit 0/1, no output |
+| `coldsweep converged [--half H]` | Exit 0/1, no output. `--half decidable` gates on the rules a subsystem decides |
+| `coldsweep languages` | Which languages resolve to symbols here, and which need a grammar |
 | `coldsweep adjudicate` | Triage disputed and unclassified findings |
 | `coldsweep run` | The full loop until converged or `max_rounds` |
 
-All of them except `task list` take `--task`/`-t`.
+All of them except `task list` and `languages` take `--task`/`-t`.
 
 ## State
 
@@ -141,6 +147,14 @@ anchor names and confirms the offending snippet is gone; that is `verified`. A f
 consecutive scans simply stopped re-deriving is `lapsed` — closed, but nothing inspected the
 repository to close it. `coldsweep status` counts them separately, so a green run shows how
 much of its green came from evidence.
+
+A finding with no snippet is closed by re-running whatever decided it: a spec item against the
+marker set, an `untested-behaviour` finding against the mutation survivor set. Both are
+exhaustive over their scope, so an anchor missing from the re-derived set is proof rather than
+silence — and this is the only reason a `tests` task closes anything on evidence at all.
+Measured on a two-file C# project, the fix turned 25% evidence-backed closure into 100%. It
+costs no extra work inside `coldsweep run`: the sweep runs against the post-fix tree, which is
+the tree the next round's scan measures, so that scan comes back from the cache.
 
 Verification searches the anchored symbol, falling back to its file when the anchor names no
 symbol. Searching wider cannot tell a fix from an unrelated copy of the same snippet, and a
@@ -212,6 +226,20 @@ In practice:
 - Whenever a rule becomes expressible deterministically, move it to a subsystem and mark it
   `decided_by: code`. That is the only way a rule joins the convergent half.
 
+Because the two halves behave differently, they are gated separately. On a mixed profile the
+global gate can never open -- every measured run ended with the agent half still producing
+findings -- so a single verdict lets the plateau hide an answer the deterministic half already
+reached:
+
+```
+coldsweep converged --task features                  # 1: the agent rules are still going
+coldsweep converged --task features --half decidable # 0: every frozen spec item is implemented
+```
+
+`coldsweep status` prints both halves whenever a profile has rules in each. A profile whose
+rules are all agent-decided has nothing to split and prints nothing extra. Naming a half that no
+rule falls into exits 2, not 0: there is no answer there to report.
+
 ## Profile
 
 ```yaml
@@ -256,6 +284,7 @@ mutation:
   test_command: "python -m pytest -q -x {tests}"
   test_patterns: ["tests/test_{stem}.py"]
   operators: ["comparison", "arithmetic", "boolean", "constant", "return"]
+  build_command: null            # compiled languages: gate each mutant on the build first
   stop_at_first_survivor: true
 ```
 
@@ -265,7 +294,7 @@ coldsweep mutants --task pin-behaviour
 
 ```
 7 mutant(s) over 1 file(s) in 1.4s
-  killed 4   survived 3   no tests 0   errors 0
+  killed 4   survived 3   no tests 0   not built 0   errors 0
 
 nothing pins these 1 symbol(s)
   src/pricing.py::discount
@@ -372,6 +401,9 @@ subsystem already answers exhaustively invites it to report the same item under 
 anchor — a duplicate at best, a contradiction of the exhaustive answer at worst. Agents handle
 only the tail. A profile whose rules are all `decided_by: code` spawns no scan agents at all.
 
+The flag is also what the split gate reads: `--half decidable` is exactly the `decided_by: code`
+rules, `--half budgeted` exactly the rest.
+
 ### Mechanical checks
 
 Deterministic checks run before each round, exhaustive over their rule:
@@ -442,10 +474,61 @@ state the tool exists to remove.
 2. Scan agents never see prior findings, prior rounds, or diffs.
 3. `description` is never used for identity.
 4. No file-level completion state exists — status lives on findings only.
-5. Merge errs toward duplicates, never toward loss.
+5. Merge errs toward duplicates, never toward loss — and the similarity fallback is skipped
+   entirely for `decided_by: code` rules, whose anchors are machine-derived and whose
+   descriptions are templates, so scoring them could only lose real items.
 6. Every round is a full independent re-derivation.
 7. `findings.jsonl` is the source of truth; SQLite is rebuildable.
 8. No command acts on a task it was not given; no task inherits another's rounds or findings.
+
+## Languages
+
+Scope resolution, identity, merge and convergence are language-neutral: shards come from
+`git ls-files`, and evidence hashing normalizes `#`, `//` and `/* */` comments. Two things need
+a parser -- locating the symbol an anchor names, so `verify` can search inside it rather than
+across the whole file, and generating mutants.
+
+| Language | Extensions | Needs |
+|---|---|---|
+| Python | `.py` | nothing; the stdlib `ast` path |
+| C# | `.cs` | `coldsweep[languages]` |
+| TypeScript / JavaScript | `.ts .tsx .js .jsx .mts .cts .mjs .cjs` | `coldsweep[languages]` |
+| Go | `.go` | `coldsweep[languages]` |
+| Rust | `.rs` | `coldsweep[languages]` |
+| Java | `.java` | `coldsweep[languages]` |
+| anything else | — | a table entry in `syntax.py` plus a test |
+
+All of them resolve symbols and generate mutants.
+
+```
+uv add "coldsweep[languages]"
+coldsweep languages          # what resolves here
+```
+
+Grammars ship as one wheel per language, each carrying its own compiled parser. Deliberately
+not `tree-sitter-language-pack`: it downloads grammars into a user cache on first use, and a
+tool whose claim is that its decisions are deterministic cannot resolve symbols differently
+depending on whether the machine had network access.
+
+A language with no support is never an error. `verify` defers instead of deciding, and mutation
+skips the file -- so the only symptom is work quietly not happening, which is what
+`coldsweep languages` exists to show. Adding one is a table entry in `syntax.py` and a test
+against a real sample; do not add one from a grammar's documentation, because node type names
+differ between grammars in ways only parsing reveals and a wrong entry returns nothing, which
+reads exactly like a clean file.
+
+**Anchors are qualified enough to stay unique.** A Go method takes its receiver
+(`Repo::Count` and `Store::Count`, not two `Count`s), a Rust method takes its `impl` type, and a
+C# namespace or a Rust `mod` contributes nothing — an agent writes `Repo::Count`, never
+`App.Core::Repo::Count`. This is not cosmetic: two symbols on one anchor derive one id, and
+merge absorbs the second finding without a trace.
+
+**Mutation in a statically typed language is narrower on purpose.** Only type-preserving
+mutations are generated -- operator and literal swaps, never the classic `return null`. A mutant
+that does not compile exits non-zero exactly like a failing test, so it would be recorded as
+*killed* and the symbol reported as pinned by tests that never ran against it. Set
+`build_command` to gate on the compiler as well: a mutant that fails to build is recorded
+`not_built` and counts as evidence about neither the suite nor the symbol.
 
 ## Known limits
 
@@ -459,6 +542,9 @@ state the tool exists to remove.
   as a new finding rather than a still-open one. Errs toward extra work, not silent loss.
 - A finding whose anchor names a file the profile neither audits nor may edit can never be
   verified, only lapsed. Widen `editable` rather than accepting silence as proof.
+- `coldsweep verify` runs the test suite when the profile has a `mutation:` block, because that
+  is what deciding those findings costs. Standalone, that is a slow command; inside
+  `coldsweep run` it is paid for by the next round's cache hit.
 - Presence mode verifies non-vacuity by model judgement, except where a `mutation:` block
   gives it a deterministic predicate.
 - The mutation runtime is serial within a working tree. The cache, not parallelism, is what
@@ -468,6 +554,18 @@ state the tool exists to remove.
 - `stop_at_first_survivor` bounds cost by stopping once a symbol is known to be unpinned, so
   the reported survivor list is a sample rather than the full set. Turn it off for a complete
   enumeration.
+- Outside Python, mutation is restricted to type-preserving operators, so a symbol pinned only
+  against a type change is not caught. `build_command` costs one build per mutant and is the
+  only honest way to run the wider set — without it a rejected mutant is indistinguishable from
+  a caught one.
+- `+` is only withheld where an operand is a string *literal*. String concatenation over
+  variables — common in Java and C# — still yields a `-` mutant that does not typecheck, so set
+  `build_command` on those or read `killed` as an upper bound.
+- The import sentinel proves a different thing per language: for Python, that the tests never
+  imported the module; for a compiled language, that the file was never built. Both mean the
+  same for the verdict, but the second is the weaker claim.
+- A language with no grammar installed is silent, not loud: `verify` defers and mutation skips
+  the file. Run `coldsweep languages` before trusting a non-Python task.
 - A features task inherits its spec's incompleteness silently: the loop checks that every
   frozen item is implemented, never that the set of items is complete.
 - Cost scales as rounds x shards, and a round that finds nothing still pays for a full scan.
@@ -478,7 +576,10 @@ state the tool exists to remove.
 
 [docs/measurements.md](docs/measurements.md) records one real end-to-end `coldsweep run` per
 profile type against this repository — convergence curves, cost per round and per shard, where
-each profile's gate stuck, and everything needed to repeat the run.
+each profile's gate stuck, and everything needed to repeat the run. Run 3 adds the language
+port measured on C# and Rust, and the Python `tests` profile the earlier runs skipped: 86%
+evidence-backed closure against run 1's 0%, and two more defects, one of them a silent deletion
+of work items in `merge`.
 
 ## Tests
 

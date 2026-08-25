@@ -5,6 +5,12 @@ enabled, on this repository. Every defect it found was then fixed and three of t
 were measured again at `24ab2fb` — see [Run 2](#run-2--the-same-measurement-against-the-repaired-tool).
 Everything before that section describes the tool as it was, not as it is.
 
+[Run 3](#run-3--the-language-port-and-the-tests-profile-measured-at-last) (2026-08-25) measures
+the language port on C# and Rust, and finally runs the Python `tests` profile that run 2 skipped.
+It found two more defects — one of them a silent deletion of work items in `merge` — and produced
+the first open gate in this document, on a three-file project, for reasons that say nothing about
+scale.
+
 ## What existed before this
 
 The README carried one measurement: five independent `issues`-style scan passes over four
@@ -32,7 +38,9 @@ sonnet, no `scan_alt`.
 | `features` | 15 | 8 → 1 → 2 → **0** | shut | 34.31 | 76 | 29 min |
 | `tests` | 13 | 123 (round 1 only — round 2 aborted) | shut | 80.48 | 208 | 96 min |
 
-**No profile converged.** `tests` never reached round 2: its own fix phase left the suite red
+**No profile converged** — none of these four, none in run 2, and not the Python `tests` profile
+when it was finally measured in run 3 either. The only task in this document that ever opened its
+gate is the three-file C# project, which is not a counterexample to anything here. `tests` never reached round 2: its own fix phase left the suite red
 and the mutation subsystem refused to measure against it, so its row is one round, not four.
 
 USD is API-equivalent — the account is a Claude Max subscription, so nothing here was billed
@@ -555,6 +563,189 @@ repository self-inconsistent in a way no later round will report.**
   exact, but cannot be re-derived. The rerun harness writes to
   `/Users/skonovalov/dev/coldsweep-bench/` for this reason.
 
+## Run 3 — the language port, and the `tests` profile measured at last
+
+Three tasks against the working tree at `ef15bd7` plus the language port. Two are scratch
+projects built to exercise that port — a C# project through the full loop, a Rust project
+through the mutation subsystem alone — and the third is the Python `tests` profile that run 2
+skipped, on an isolated copy of this repository. `dotnet` 10.0.400, `cargo` 1.96.1. No Go: the
+toolchain is not installed on this host.
+
+| Task | Shards | New per round | Gate | USD |
+|---|---|---|---|---|
+| `cs-demo` (C#) | 2 | 4 → 0 → 0 | **open** | 3.21 |
+| `rs-demo` (Rust) | 2 | mutation only, no agent calls | — | 0 |
+| `py-bench` (Python `tests`) | 4 | 34 → 3 → 2 | shut | 63.30 |
+
+**Read the C# convergence as a mechanism proof and nothing more.** Three files is not a
+codebase. The claims that survive are the ones about *machinery* — anchors, mutant generation,
+the build gate, the cache, the verify predicate, and the two defects below. The convergence
+result is not one of them; see the limits at the end.
+
+### `cs-demo` — 2 shards, 3 files, 3 rounds, $3.21
+
+Two source files and one test file. Rules: `untested-behaviour` (`decided_by: code`, mutation)
+and `vacuous-test` (agent). `k=2`, sonnet, parallelism 2, `stop_at_first_survivor: false`,
+`build_command: dotnet build`.
+
+| Round | Mutants | Killed | Survived | New | Fixed | Verified | Deferred | USD | Mutation |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | 8 | 3 | 4 | 4 | 4 | 1 | 3 | 1.97 | cached |
+| 2 | 8 | 8 | **0** | 0 | — | 0 | 3 | 0.62 | 42.7s |
+| 3 | 8 | 8 | 0 | 0 | — | 0 | 0 | 0.62 | 0.06s |
+
+Final: `verified 4, lapsed 0, open 0, disputed 0`. **`converged after 3 round(s)`, exit 0** —
+both the global gate and `--half decidable`. Cold mutation pass: 32.1s; unchanged re-run 0.08s
+on 8 mutant hits plus 2 probe hits.
+
+The fix agent replaced the assertion-free `IsFreeIsCalled` with two asserting tests, added three
+boundary cases for `Discount`, and wrote a new `tests/LoaderTests.cs`. Round 2's mutation pass
+then killed all 8 mutants, which is what makes this a measurement rather than a self-report.
+
+### `rs-demo` — mutation only, 11 mutants, no agent calls
+
+| Symbol | Verdict |
+|---|---|
+| `src/pricing.rs::Pricing::discount` | survivors: `'100' -> '101'`, `'&&' -> '\|\|'` |
+| `src/pricing.rs::Pricing::is_free` | survivors: `'==' -> '!='`, `'0' -> '1'` |
+| `src/pricing.rs::Store::discount` | survivors: `'-' -> '+'`, `'1' -> '2'` |
+| `src/loader.rs` | no paired test file |
+
+killed 3, survived 6, no tests 2, **not built 0**, 13.9s.
+
+`Pricing::discount` and `Store::discount` are two findings, not one. Both are `fn discount` and
+neither `impl` block carries a name, so without taking the segment from the `impl` type they
+derive the same anchor, the same id, and merge absorbs one of them with no trace. Same shape as
+Go's method receiver. This is the measurement that pays for that mechanism.
+
+### What the port got right
+
+**Every generated mutant compiled.** `not built 0` in both languages, across 19 mutants. That is
+the type-preservation restriction holding on real code rather than on a fixture.
+
+**And it is load-bearing.** A `return null` spliced by hand into `int Discount(...)`:
+
+```
+dotnet build src/src.csproj   -> exit 1
+dotnet test  tests/tests.csproj -> exit 1
+```
+
+Identical exit codes. Judged the way every other mutant is judged, that mutant is recorded
+**killed**, and `Discount` is reported as pinned by tests that never ran against it. The
+narrower operator set is not conservatism; it is the only thing standing between the subsystem
+and a confidently wrong clean bill.
+
+**Anchors survived the round trip.** `src/Pricing.cs::Pricing::IsFree` was written by the
+mutation subsystem, matched by merge across three rounds, and resolved by `verify` — the whole
+identity path, on a language the tool had never run against.
+
+### The first defect: `verify` could not decide a mutation finding
+
+**10.** Run 1's structural defect for `features`
+— `verify_findings` deciding only `absence` findings with evidence — was fixed for
+`unimplemented-spec-item` by re-deriving the marker set, and the same fix was never extended to
+the mutation rule. `tests` was not re-run in run 2, so nothing caught it.
+
+It showed up here as three findings frozen at `fixed` after round 2, while that same round's
+mutation pass reported `survived 0` — exhaustive proof they were resolved, sitting unused. They
+could only ever close by lapsing.
+
+**Fixed** — `verify` now re-derives the survivor set and decides against it: anchor absent →
+`verified`, still present → `reopen`, subsystem unable to run → `defer`. Evidence-backed closure
+for this task went **25% → 100%**, and it is what let round 3 open the gate.
+
+The sweep runs test suites, so it fires only when a `fixed` finding under that rule exists and a
+cache path is supplied. It costs nothing inside `coldsweep run`: it measures the post-fix tree,
+which is the tree the next round's scan measures, so that scan is a cache hit. Measured — the
+verify sweep took **0.31s** and round 3's scan-time mutation pass **0.06s**, both fully cached.
+
+### `py-bench` — the Python `tests` profile, 4 shards, 3 rounds, $63.30
+
+The profile run 2 skipped, and the one the verify fix above was written for. Scoped to four
+modules (`converge`, `merge`, `verify`, `syntax`) rather than all fourteen, on cost; run against
+an isolated copy of the working tree at `ef15bd7` plus the port, with its own venv, so the fix
+phase edits nothing real.
+
+| Round | Mutants | Killed | Survived | New | Fixed | Verified | Reopened | Disputes | USD |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | 203 | 164 | 39 | 34 | 30 | 8 | 0 | 0 | 25.67 |
+| 2 | 282 | 258 | 24 | 3 | 18 | 7 | **10** | 6 | 20.50 |
+| 3 | 299 | 278 | 21 | 2 | 14 | 3 | 5 | 15 | 17.13 |
+
+Final: `verified 18, disputed 15, lapsed 3, fixed 2, open 1`. Exit 1 — three blockers, of which
+15 unadjudicated disputes is the one nothing in the loop can clear. Mutant counts *rise* between
+rounds because `stop_at_first_survivor` skips the rest of an anchor once one survives; as
+symbols get pinned, fewer are skipped and more are actually judged.
+
+**Run 1's `tests` failure did not recur.** That row was one round: the fix phase left the suite
+red and the mutation baseline refused round 2. Here three fix phases ran and the suite ended
+**477 passing**, up from 415. The fix-phase gate built for that defect works.
+
+**Evidence-backed closure: 86%** — 18 verified against 3 lapsed. Run 1's `tests` closed **0%** of
+its findings on evidence. That difference is the verify fix, and this is the measurement it was
+missing.
+
+**And it reopens as readily as it verifies.** Round 2 verified 7 and **reopened 10**: the fix
+agent reported 18 fixes, and re-deriving the survivor set proved 10 of them had not landed. The
+15 disputes are mostly those findings hitting the oscillation guard after three failed attempts.
+A predicate that only ever confirmed would have recorded all 18.
+
+### The second defect: merge deleted work items
+
+**11. The similarity fallback silently absorbed distinct symbols.** `merge` auto-merges at
+rapidfuzz ≥ 0.92 over `(anchor, description)`, gated to the same rule and file. Every mutation
+finding shares a rule, shares a file, and carries the *same description template* — so the score
+is decided by the anchor alone, and two short sibling symbols in one module clear the threshold.
+
+Measured, round 1 of this run, 9 auto-merges. Four of them:
+
+| Kept | Silently absorbed | Score |
+|---|---|---|
+| `verify.py::_decide_spec_item` | `verify.py::_decide_unpinned` | 0.934 |
+| `syntax.py::_python_ranges` | `syntax.py::_tree_ranges` | 0.925 |
+| `syntax.py::mutation_sites::binary` | `syntax.py::mutation_sites::unary` | 0.922 |
+| `verify.py::_defer` | `verify.py::_reopen` | 0.965 |
+
+These are unrelated functions. 21 work items were deleted across the three rounds, and the only
+trace is a line in the absorbing finding's history. This is a direct breach of **invariant 5**
+— merge errs toward duplicates, never toward loss — in the module the spec calls the
+highest-risk one, and it went unseen through two prior measurement runs because neither ran a
+profile whose findings are machine-generated.
+
+A second cost: 29 adjudication calls, **$6.03**, of which 28 ruled "different". The 0.75–0.92
+band is entirely spurious for this rule class.
+
+**Fixed** — the similarity fallback and the adjudication call are skipped for any rule marked
+`decided_by: code`. Such a rule is exhaustive and its anchors are machine-derived, so two
+anchors are two work items by construction: there is no differently-phrased duplicate for the
+fallback to catch, and nothing for it to do but lose things. Exact identity matching is
+untouched, so a re-derived finding still merges.
+
+### Limits of run 3
+
+- **Three files.** The gate opened because `vacuous-test` ran out of things to say about two
+  source files and one test file — not because the enumeration floor moved. On the 15-shard
+  Python `issues` runs the agent half never went quiet once in eight rounds across two runs.
+  Nothing here contradicts that, and nothing here should be read as convergence becoming
+  achievable at scale.
+- `n=1`, one commit, two scratch projects written for this measurement. They are not code
+  anyone wrote for another purpose, which is exactly the property real repositories have.
+- Round 1's mutation pass shows `cached` because a standalone `coldsweep mutants` had already
+  run against the same tree. The honest cold number is 32.1s, measured separately.
+- Cost is not comparable to runs 1 and 2: 2 shards against 15, and a taxonomy of two rules.
+- Per-mutant wall time is dominated by `dotnet test` rebuilding, not by anything coldsweep does.
+- **No Go measurement.** The table entry has unit tests against a parsed sample and no
+  end-to-end run behind it, exactly as `tests` had before this.
+- `py-bench` is **4 of the profile's 14 shards**, chosen for fast paired suites. The finding
+  counts and the $63.30 are not comparable with run 1's 13-shard `tests` row; the mechanism
+  results — closure rate, reopen rate, suite health, the merge defect — do not depend on scope.
+- `py-bench` audits the code written earlier in this same session, including `syntax.py` and the
+  two fixes above. That makes it a fair test of the machinery and a poor test of a *typical*
+  module: new code has thinner tests than settled code, so 39 unpinned symbols from four files
+  should not be read as a rate.
+- Its 15 disputes are unadjudicated. Nothing here says whether they are real work or the
+  oscillation guard giving up on findings that a fix agent cannot pin in three attempts.
+
 ---
 
 # Repeating this
@@ -593,6 +784,33 @@ done
 uv sync                                  # driver venv, in the main checkout
 cd $BR/wt/tests && uv sync               # the tests profile shells out to pytest
 ```
+
+## Run 3's projects
+
+Both were scratch projects written for the measurement and are not retained — they lived in a
+session scratchpad of the kind that already cost this document its run-1 per-call JSONL. The
+sources are ~40 lines each and are described by symbol in the run 3 section; the part worth
+copying is the profile, since nothing else in this document configures a non-Python task:
+
+```yaml
+scope: {include: ["src/**/*.cs"]}
+editable: {include: ["tests/**/*.cs"]}
+fix_scope: task
+rules:
+  - {id: untested-behaviour, mode: presence, decided_by: code, description: "..."}
+  - {id: vacuous-test, mode: absence, description: "..."}
+mutation:
+  rule_id: untested-behaviour
+  test_command: "dotnet test tests/tests.csproj -v q --nologo"
+  build_command: "dotnet build src/src.csproj -v q --nologo"
+  test_patterns: ["tests/{stem}Tests.cs"]
+  stop_at_first_survivor: false
+```
+
+`test_command` deliberately contains no `{tests}`: `dotnet test` takes a project, not a file
+list. `test_patterns` still has to match real files, because a source with no paired test is
+`no_tests` rather than a judged shard — and it is what the cache keys on, so with this shape
+editing an unpaired test file does not invalidate anything.
 
 ## The meter
 

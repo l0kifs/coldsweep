@@ -55,6 +55,7 @@ coldsweep/
   store.py         # load/save findings.jsonl, id assignment
   merge.py         # identity, matching, merge decisions   <- highest-risk module
   converge.py      # round bookkeeping, termination check
+  syntax.py        # extension -> symbol ranges and mutation sites
   shard.py         # scope -> deterministic shard list
   mechanical.py    # run profile-defined deterministic checks
   runner.py        # subprocess agent invocation, schema enforcement
@@ -232,7 +233,8 @@ coldsweep ingest runs/<N>.json      validate, merge, update findings.jsonl
 coldsweep fix [--rule R]            work open findings
 coldsweep verify                    re-check fixed findings against evidence_sha
 coldsweep status                    counts by status/rule; lists unclassified + disputed
-coldsweep converged                 exit 0/1 — the gate
+coldsweep converged [--half H]      exit 0/1 — the gate; H is decidable|budgeted
+coldsweep languages                 which languages resolve to symbols here
 coldsweep adjudicate                interactive triage of disputed + unclassified
 coldsweep run                       full loop until converged or max_rounds
 ```
@@ -316,3 +318,58 @@ shut permanently.
 - Feature profiles inherit spec incompleteness silently.
 - Cost scales as rounds × shards. The tool trades tokens and wall-clock for the user no
   longer being the loop condition.
+- Symbol resolution and mutant generation need a parser per language. Python uses stdlib
+  `ast`; C#, TypeScript/JavaScript, Go, Rust and Java use tree-sitter grammars from the
+  `languages` extra. A language without one is silent — `verify` defers and mutation skips the
+  file. `coldsweep languages` reports it.
+- Anchor uniqueness is per language: a Go method carries its receiver and a Rust method its
+  `impl` type, because two symbols sharing an anchor derive one id and merge absorbs one of
+  them. Wrappers an agent would not write — a C# namespace, a Rust `mod` — contribute nothing.
+- In a statically typed language only type-preserving mutations are generated. A mutant that
+  does not compile exits like a failing test, so without `build_command` it would be recorded
+  as killed and the symbol reported as tested when nothing tested it.
+
+## 18. Amendment: the gate is per half
+
+§7 defines one global gate. Two measured end-to-end runs (docs/measurements.md) found that a
+profile mixing `decided_by: code` rules with agent-decided ones can never open it: the agent
+half was still producing new findings in the final round of every run, in both runs, for every
+type. The deterministic half had settled rounds earlier and the single verdict hid it.
+
+`evaluate` therefore reports `decidable` and `budgeted` alongside the global verdict, each
+measured over the same rounds and the same K, differing only in rule set. The global gate is
+unchanged and remains the strict answer. Unclassified findings and external blockers stay
+global: an off-taxonomy rule id belongs to neither half, and a drifted spec is not a property
+of one half's rules.
+
+## 19. Amendment: a subsystem-decided rule is verified by re-deriving it
+
+§5.1 makes `evidence_sha` the fix predicate, which only exists for `absence` findings. A rule a
+subsystem decides carries no snippet, so `verify` could only ever defer it and the finding closed
+by lapsing — silence, not proof.
+
+Both such rules are now decided by re-running their decider: `unimplemented-spec-item` against
+the marker set, and the `mutation:` rule against the survivor set. Each is exhaustive over its
+scope, so an anchor missing from the re-derived set is proof. Measured on a two-file C# project,
+this moved evidence-backed closure for a `tests` task from 25% to 100%.
+
+The mutation sweep runs test suites, so it happens only when a `fixed` finding under that rule
+exists and a cache path is supplied. It adds no work inside `coldsweep run`: it measures the
+post-fix tree, which is the tree the next round's scan measures, so that scan is a cache hit.
+Standalone `coldsweep verify` on such a profile is correspondingly slow, and that is the honest
+price of the answer.
+
+## 20. Amendment: the similarity fallback is for agent output only
+
+§6 step 3 applies the rapidfuzz fallback to every rule. Measured on a Python `tests` task
+(docs/measurements.md, run 3), that deleted 21 real work items: a subsystem's findings share a
+rule, share a file, and carry one description template, so the score rests on the anchor alone
+and two short sibling symbols clear the 0.92 auto-merge threshold. `_defer` absorbed `_reopen`.
+
+Steps 3 and its adjudication call are now skipped for any rule marked `decided_by: code`. Such a
+rule is exhaustive and its anchors are derived, not phrased, so two anchors are two work items by
+construction — there is no differently-phrased duplicate to catch. Step 2, exact identity, is
+unchanged and is what merges a re-derived finding across rounds.
+
+The fallback exists because *agents* phrase the same finding differently every run. Applying it
+where nothing is phrased was the error.
