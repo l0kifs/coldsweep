@@ -9,6 +9,20 @@ dependencies = [
     "typer>=0.12",
     "rapidfuzz>=3.9",
     "pyyaml>=6.0",
+    "tree-sitter>=0.24",
+]
+
+# One wheel per language, each shipping its own compiled grammar. Deliberately not
+# `tree-sitter-language-pack`: that one downloads grammars into a user cache on first use, and a
+# tool whose whole claim is that its decisions are deterministic cannot resolve symbols
+# differently depending on whether the machine had network access.
+[project.optional-dependencies]
+languages = [
+    "tree-sitter-c-sharp>=0.23",
+    "tree-sitter-go>=0.25.0",
+    "tree-sitter-java>=0.23.5",
+    "tree-sitter-rust>=0.24.2",
+    "tree-sitter-typescript>=0.23",
 ]
 
 [project.scripts]
@@ -17,6 +31,7 @@ coldsweep-stop-hook = "coldsweep.hooks.stop:main"
 
 [dependency-groups]
 dev = [
+    "coldsweep[languages]",
     "pytest>=8.3",
     "ruff>=0.6",
     "pylint>=3.2",
@@ -55,6 +70,9 @@ disable = [
     "duplicate-code",
 ]
 max-line-length = 120
+# cli.py is a flat list of commands with no shared state; splitting it would trade one long
+# readable file for an import graph. Revisit if it outgrows this.
+max-module-lines = 1200
 
 [tool.pylint.basic]
 # ast.NodeVisitor dispatches on method names that mirror AST node classes; they cannot be snake_case.

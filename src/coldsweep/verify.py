@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from . import mutation, syntax
 from .models import Finding, Profile, evidence_sha, normalize_snippet
 from .shard import ShardError, governed_files
 from .spec import SpecError, implemented_items, symbol_text
@@ -87,15 +88,62 @@ def _decide_spec_item(stats: dict[str, int], finding: Finding, round_no: int,
         _reopen(stats, finding, round_no, f"nothing in scope carries a marker for {item}")
 
 
-def verify_findings(repo: Path, profile: Profile, findings: list[Finding], round_no: int) -> dict[str, int]:
+def _decide_unpinned(stats: dict[str, int], finding: Finding, round_no: int,
+                     unpinned: set[str] | None) -> None:
+    """Decide one mutation finding against the re-derived survivor set.
+
+    ``unpinned`` is every anchor the subsystem still reports. It is exhaustive over its scope,
+    so an anchor missing from it is proof the symbol is now pinned -- not silence. That
+    distinction is the whole reason this branch exists: without it the finding could only close
+    by lapsing, and a `tests` task closed nothing on evidence.
+
+    ``None`` means the subsystem could not run -- a red baseline, a broken build command -- which
+    says nothing about the fix either way, so the finding defers.
+    """
+    if unpinned is None:
+        _defer(stats, finding, round_no, "the mutation subsystem could not run")
+        return
+    if finding.anchor in unpinned:
+        _reopen(stats, finding, round_no,
+                f"the suite still passes with {finding.anchor} mutated")
+    else:
+        _verified(stats, finding, round_no,
+                  f"no mutation of {finding.anchor} survives the suite")
+
+
+def _rederive_unpinned(repo: Path, profile: Profile, cache: Path | None,
+                       lock: Path | None) -> set[str] | None:
+    """Every anchor the mutation subsystem still reports, or ``None`` when it could not run.
+
+    Cost-neutral inside ``coldsweep run``. The pass runs against the post-fix tree, and the next
+    round's scan then runs against that same tree, so its verdicts come back as cache hits: the
+    same two passes per round as before, one of them moved earlier and turned into proof.
+    """
+    if profile.mutation is None or cache is None:
+        return None
+    try:
+        survivors, _ = mutation.run(repo, profile, cache, lock)
+    except mutation.MutationError:
+        return None
+    return {raw.anchor for raw in survivors}
+
+
+def verify_findings(repo: Path, profile: Profile, findings: list[Finding], round_no: int,
+                    mutants_cache: Path | None = None,
+                    mutation_lock: Path | None = None) -> dict[str, int]:
     """Re-check every ``fixed`` finding against its evidence, in the file its anchor names.
 
-    Decides two kinds of finding. ``absence`` findings that carry evidence *and* whose anchor
+    Decides three kinds of finding. ``absence`` findings that carry evidence *and* whose anchor
     names a readable file the profile governs -- audited or editable -- are decided by looking
     for the offending snippet, inside the anchored symbol where one can be located and in the
-    whole file otherwise. ``unimplemented-spec-item`` findings are decided by re-deriving the
-    marker set, which is exhaustive over scope and costs one regex pass; they are anchored in
-    the spec document and carry no snippet, so the snippet path can never decide them.
+    whole file otherwise. The other two carry no snippet, so the snippet path can never decide
+    them, and each is decided by re-running the subsystem that raised it: spec items against the
+    marker set, mutation findings against the survivor set. Both are exhaustive over their
+    scope, which is what makes an anchor's absence proof rather than silence.
+
+    Re-running the mutation subsystem here needs ``mutants_cache``; without it those findings
+    defer exactly as before. It is not an extra pass: it runs against the post-fix tree, which is
+    the tree the next round's scan measures too, so that scan comes back from the cache.
 
     A surviving snippet is not by itself proof that a fix failed. Whole classes of remedy are
     additive -- handling wrapped around a call, validation added after a read -- and leave the
@@ -120,7 +168,7 @@ def verify_findings(repo: Path, profile: Profile, findings: list[Finding], round
         governed: set[str] | None = set(governed_files(repo, profile))
     except ShardError:
         governed = None
-    # Re-derived once for the whole pass, not per finding: the sweep is over all of scope.
+    # Re-derived once for the whole pass, not per finding: each sweep is over all of scope.
     spec_rule = profile.spec.unimplemented_rule_id if profile.spec else None
     implemented: set[str] | None = set()
     if spec_rule:
@@ -128,10 +176,19 @@ def verify_findings(repo: Path, profile: Profile, findings: list[Finding], round
             implemented = implemented_items(repo, profile)
         except (ShardError, SpecError):
             implemented = None
+    # Only when something actually needs it: the mutation sweep runs test suites, and a pass
+    # that would decide nothing is pure cost.
+    mutation_rule = profile.mutation.rule_id if profile.mutation else None
+    unpinned: set[str] | None = None
+    if mutation_rule and any(f.rule_id == mutation_rule for f in candidates):
+        unpinned = _rederive_unpinned(repo, profile, mutants_cache, mutation_lock)
     sources: dict[str, str | None] = {}
     for f in candidates:
         if spec_rule and f.rule_id == spec_rule:
             _decide_spec_item(stats, f, round_no, implemented)
+            continue
+        if mutation_rule and f.rule_id == mutation_rule:
+            _decide_unpinned(stats, f, round_no, unpinned)
             continue
         if not f.evidence or profile.mode_of(f.rule_id) != "absence":
             stats["deferred"] += 1
@@ -152,6 +209,14 @@ def verify_findings(repo: Path, profile: Profile, findings: list[Finding], round
             _defer(stats, f, round_no,
                    f"{where} changed but the cited snippet is still there, which is what an "
                    f"additive remedy looks like")
+        elif body is None and "::" in f.anchor and not syntax.resolves(f.file):
+            # The snippet survives somewhere in the file, and no symbol could be located to say
+            # whether it survives in *this* one. Outside a resolvable language those are the same
+            # observation, and reopening on it fails a correct fix whenever the same idiom appears
+            # twice in a file. Deferring costs one more round; reopening costs a real fix.
+            _defer(stats, f, round_no,
+                   f"no syntax support for {f.file}, so the snippet can only be searched "
+                   f"file-wide, which cannot tell a fix from another copy of the same idiom")
         else:
             _reopen(stats, f, round_no, f"evidence still present in {where}, unchanged")
     return stats

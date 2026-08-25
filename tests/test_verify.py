@@ -133,3 +133,50 @@ def test_evidence_within_one_file_is_still_a_match(repo: Path):
     findings = [_finding("first_half()\nsecond_half()")]
     verify_findings(repo, _profile(), findings, 2)
     assert findings[0].status == "open"
+
+
+def _scoped_profile(include: list[str]) -> Profile:
+    data = yaml.safe_load((FIXTURES / "profile_mixed.yaml").read_text())
+    data["scope"]["include"] = include
+    return Profile.model_validate(data)
+
+
+def _foreign(file: str, anchor: str, evidence: str):
+    f = RawFinding(rule_id="swallowed-exception", anchor=anchor, evidence=evidence,
+                   description="d").to_finding("s", 1)
+    f.status = "fixed"
+    return f
+
+
+def test_a_file_with_no_syntax_support_defers_instead_of_reopening(repo: Path):
+    """Outside a resolvable language the snippet can only be searched file-wide.
+
+    A second copy of the same idiom then reopens a finding whose own copy was fixed. Deferring
+    costs one more round; reopening throws away a correct fix and eventually disputes it.
+    """
+    (repo / "src" / "app.rb").write_text(
+        "def a\n  begin\n    g\n  rescue\n  end\nend\n\n"
+        "def b\n  begin\n    g\n  rescue\n  end\nend\n")
+    findings = [_foreign("src/app.rb", "src/app.rb::a", "rescue\nend")]
+    stats = verify_findings(repo, _scoped_profile(["src/**/*.rb"]), findings, 2)
+    assert stats["deferred"] == 1 and stats["reopened"] == 0
+    assert findings[0].status == "fixed"
+    assert "no syntax support" in findings[0].history[-1].detail
+
+
+def test_a_resolvable_language_still_verifies_per_symbol(repo: Path):
+    """C# resolves, so a fix in one method is not undone by the same idiom in another."""
+    (repo / "src" / "R.cs").write_text(
+        "class R {\n  void A() { try { g(); } catch (Exception) { throw; } }\n"
+        "  void B() { try { g(); } catch (Exception) { }\n }\n}\n")
+    findings = [_foreign("src/R.cs", "src/R.cs::R::A", "catch (Exception) { }")]
+    stats = verify_findings(repo, _scoped_profile(["src/**/*.cs"]), findings, 2)
+    assert stats["verified"] == 1 and findings[0].status == "verified"
+
+
+def test_a_deleted_symbol_in_a_resolvable_language_is_not_a_free_pass(repo: Path):
+    """The grammar resolves, so `None` here means the symbol is gone, not that we cannot tell."""
+    (repo / "src" / "R.cs").write_text("class R {\n  void B() { try { g(); } catch (Exception) { } }\n}\n")
+    findings = [_foreign("src/R.cs", "src/R.cs::R::A", "catch (Exception) { }")]
+    stats = verify_findings(repo, _scoped_profile(["src/**/*.cs"]), findings, 2)
+    assert stats["reopened"] == 1 and findings[0].status == "open"

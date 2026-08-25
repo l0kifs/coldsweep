@@ -19,13 +19,13 @@ converges cleanly. Nothing here changes that, and nothing here should pretend to
 
 from __future__ import annotations
 
-import ast
 import hashlib
 import re
 from pathlib import Path
 
 from pydantic import ValidationError
 
+from . import syntax
 from .models import (
     Profile,
     RawFinding,
@@ -126,51 +126,11 @@ def drift_of(lock: SpecLock | None, items: list[SpecItem]) -> SpecDrift:
 
 # --- traceability ----------------------------------------------------------
 
-def symbol_ranges(source: str) -> list[tuple[int, int, str]]:
-    """Line ranges of every function and class, innermost last, for anchoring a marker."""
-    try:
-        tree = ast.parse(source)
-    except (SyntaxError, ValueError):
-        return []
-    ranges: list[tuple[int, int, str]] = []
-
-    def walk(node: ast.AST, stack: list[str]) -> None:
-        for child in ast.iter_child_nodes(node):
-            if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
-                path = [*stack, child.name]
-                ranges.append((child.lineno, child.end_lineno or child.lineno, "::".join(path)))
-                walk(child, path)
-            else:
-                walk(child, stack)
-
-    walk(tree, [])
-    return ranges
-
-
-def symbol_text(source: str, anchor: str) -> str | None:
-    """The source of the symbol an anchor names, or ``None`` when it cannot be located.
-
-    ``None`` is the answer for a module-level anchor, a renamed or deleted symbol, and a file
-    that no longer parses. Every caller treats it as "cannot tell" rather than as an empty
-    symbol, because the three cases are indistinguishable here and none of them is evidence.
-    """
-    path = anchor.split("::", 1)[1] if "::" in anchor else ""
-    if not path:
-        return None
-    lines = source.splitlines()
-    for start, end, symbol in symbol_ranges(source):
-        if symbol == path:
-            return "\n".join(lines[start - 1:end])
-    return None
-
-
-def anchor_for(file: str, source: str, lineno: int) -> str:
-    """The innermost symbol containing a line, as a stable anchor. Never a line number."""
-    best_start, best_path = -1, ""
-    for start, end, path in symbol_ranges(source) if file.endswith(".py") else []:
-        if best_start < start <= lineno <= end:
-            best_start, best_path = start, path
-    return f"{file}::{best_path}" if best_path else file
+# Symbol resolution lives in `syntax`, which dispatches on file extension. Re-exported here
+# because traceability and verification both reach for it through this module.
+symbol_ranges = syntax.symbol_ranges
+symbol_text = syntax.symbol_text
+anchor_for = syntax.anchor_for
 
 
 def find_markers(repo: Path, profile: Profile) -> dict[str, list[tuple[str, str]]]:

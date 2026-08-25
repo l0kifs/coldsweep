@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 from conftest import git_init
 
-from coldsweep.models import MutationConfig, Profile, Scope
+from coldsweep.models import MutationConfig, MutationReport, Profile, RawFinding, Scope
 from coldsweep.mutation import (
     BACKUP_SUFFIX,
     MutationCache,
@@ -23,6 +23,7 @@ from coldsweep.mutation import (
     restore_interrupted,
     run,
 )
+from coldsweep.verify import verify_findings
 
 SOURCE = '''"""Module docstring, not behaviour."""
 
@@ -425,3 +426,170 @@ def test_a_completed_run_leaves_no_lock(project: Path):
     lock = project / "mutants.lock"
     run(project, profile(), project / "cache.sqlite", lock)
     assert not lock.exists()
+
+
+# --- languages other than Python -------------------------------------------
+
+CSHARP = """namespace App {
+  public class Gate {
+    public int Port(string raw) {
+      int port = int.Parse(raw);
+      if (port >= 1 && port <= 65535) { return port; }
+      return 0;
+    }
+    public bool Allows(bool v) { return !v; }
+  }
+}
+"""
+
+
+def cs_mutants(**kw):
+    return generate_mutants("src/Gate.cs", CSHARP.encode(), config(**kw))
+
+
+def test_csharp_mutants_carry_symbol_anchors():
+    anchors = {m.anchor for m in cs_mutants()}
+    assert "src/Gate.cs::Gate::Port" in anchors
+    assert not any(":" in a.split("::")[-1] for a in anchors)
+
+
+def test_a_typed_language_is_never_offered_a_type_changing_mutation():
+    """`return null` on an `int` method does not compile, and a build failure exits non-zero.
+
+    Judged by exit code alone that reads as *killed*, so the symbol would be reported as pinned
+    by tests that never ran against it. Under-reporting a finding is the failure this tool
+    exists to prevent, so the operator is withheld rather than caveated.
+    """
+    assert not [m for m in cs_mutants() if m.operator == "return"]
+    assert not [m for m in cs_mutants() if m.mutated in ("null", "None")]
+
+
+def test_python_keeps_its_return_operator():
+    """The narrowing is for typed languages only; Python's reference behaviour is unchanged."""
+    assert [m for m in mutants() if m.operator == "return"]
+
+
+def test_mutants_splice_bytes_in_any_language():
+    body = CSHARP.encode()
+    for m in cs_mutants():
+        assert apply_mutant(body, m) != body
+        assert apply_mutant(body, m)[:m.start] == body[:m.start]
+
+
+def test_csharp_generation_is_deterministic():
+    assert [m.id for m in cs_mutants()] == [m.id for m in cs_mutants()]
+
+
+def test_a_file_whose_language_has_no_grammar_yields_no_mutants():
+    assert generate_mutants("src/app.rb", b"def f\n  1 + 2\nend\n", config()) == []
+
+
+def test_shards_are_built_for_every_resolvable_language(tmp_path: Path):
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "a.py").write_text("def f(x):\n    return x + 1\n")
+    (tmp_path / "src" / "B.cs").write_text(CSHARP)
+    (tmp_path / "src" / "notes.md").write_text("# not code\n")
+    (tmp_path / "src" / "app.rb").write_text("def f\n  1 + 2\nend\n")
+    git_init(tmp_path)
+    subprocess.run(["git", "add", "-A"], cwd=tmp_path, check=True)
+    profile = Profile.model_validate({
+        "version": 1, "name": "t",
+        "scope": {"include": ["src/**/*"]},
+        "rules": [{"id": "untested-behaviour", "mode": "presence", "decided_by": "code",
+                   "description": "d"}],
+        "mutation": {"rule_id": "untested-behaviour"},
+    })
+    sources = {s.source for s in build_mutation_shards(tmp_path, profile)}
+    assert sources == {"src/a.py", "src/B.cs"}
+
+
+def test_a_mutant_that_does_not_build_is_not_recorded_as_killed(project: Path):
+    """A rejected mutant was never run, so it is evidence about the compiler, not the suite."""
+    (project / "tests" / "test_port.py").write_text(STRONG_TEST)
+    built = profile(build_command="exit 3")
+    cache = MutationCache(project / "cache.sqlite")
+    runner = MutationRunner(project, built.mutation, cache)
+    shard = next(s for s in build_mutation_shards(project, built) if s.mutants)
+    results = list(runner.run_shard(shard, runner.shard_key(shard), MutationReport()))
+    cache.close()
+    assert results and all(r.outcome == "not_built" for r in results)
+    assert not any(r.survived for r in results)
+    assert not any(r.decided for r in results)
+
+
+def test_every_mutant_failing_to_build_is_refused_rather_than_reported_clean(project: Path):
+    """No survivors because nothing ever ran is not the same answer as no survivors."""
+    (project / "tests" / "test_port.py").write_text(STRONG_TEST)
+    with pytest.raises(MutationError, match="every mutant failed to build"):
+        run(project, profile(build_command="exit 3"), project / "cache.sqlite")
+
+
+def test_a_build_that_passes_leaves_the_verdict_to_the_suite(project: Path):
+    """The gate only removes mutants the compiler rejected; it decides nothing on its own."""
+    (project / "tests" / "test_port.py").write_text(STRONG_TEST)
+    _, report = run(project, profile(build_command="exit 0", stop_at_first_survivor=False),
+                    project / "cache.sqlite")
+    assert report.not_built == 0 and report.killed == report.mutants
+
+
+# --- a mutation finding closes on proof, not on silence --------------------
+
+def _unpinned_finding(anchor: str):
+    f = RawFinding(rule_id="untested-behaviour", anchor=anchor, evidence=None,
+                   description="d").to_finding("s", 1)
+    f.status = "fixed"
+    return f
+
+
+def test_a_symbol_the_suite_now_pins_is_verified_not_deferred(project: Path):
+    """The subsystem is exhaustive, so an anchor missing from its output is proof of the fix.
+
+    Without this branch the finding could only close by lapsing, and a `tests` task closed
+    nothing at all on evidence -- measured end to end on a C# repository.
+    """
+    (project / "tests" / "test_port.py").write_text(STRONG_TEST)
+    findings = [_unpinned_finding("src/port.py::parse_port")]
+    stats = verify_findings(project, profile(stop_at_first_survivor=False), findings, 2,
+                            project / "cache.sqlite", project / "mutants.lock")
+    assert stats["verified"] == 1 and findings[0].status == "verified"
+    assert "no mutation of" in findings[0].history[-1].detail
+
+
+def test_a_symbol_still_unpinned_is_reopened(project: Path):
+    (project / "tests" / "test_port.py").write_text(VACUOUS_TEST)
+    findings = [_unpinned_finding("src/port.py::parse_port")]
+    stats = verify_findings(project, profile(), findings, 2,
+                            project / "cache.sqlite", project / "mutants.lock")
+    assert stats["reopened"] == 1 and findings[0].status == "open"
+
+
+def test_a_subsystem_that_cannot_run_defers_rather_than_deciding(project: Path):
+    """A red baseline says nothing about the fix, so it must not close or reopen anything."""
+    (project / "tests" / "test_port.py").write_text("def test_broken():\n    assert False\n")
+    findings = [_unpinned_finding("src/port.py::parse_port")]
+    stats = verify_findings(project, profile(), findings, 2,
+                            project / "cache.sqlite", project / "mutants.lock")
+    assert stats["deferred"] == 1 and findings[0].status == "fixed"
+
+
+def test_without_a_cache_path_the_sweep_is_not_run_at_all(project: Path):
+    """`verify_findings` runs test suites on this path; a caller that passes no cache gets none."""
+    (project / "tests" / "test_port.py").write_text(STRONG_TEST)
+    findings = [_unpinned_finding("src/port.py::parse_port")]
+    stats = verify_findings(project, profile(), findings, 2)
+    assert stats["deferred"] == 1 and findings[0].status == "fixed"
+
+
+def test_the_sweep_is_skipped_when_no_candidate_needs_it(project: Path):
+    """It runs test suites, so a pass that would decide nothing must not happen.
+
+    Proven with a test command that would hard-fail the sweep if it ever ran: the finding under
+    a different rule still resolves, so the sweep demonstrably did not happen.
+    """
+    (project / "tests" / "test_port.py").write_text(STRONG_TEST)
+    other = RawFinding(rule_id="some-other-rule", anchor="src/port.py::parse_port",
+                       evidence=None, description="d").to_finding("s", 1)
+    other.status = "fixed"
+    stats = verify_findings(project, profile(test_command="exit 7"), [other], 2,
+                            project / "cache.sqlite", project / "mutants.lock")
+    assert stats == {"verified": 0, "reopened": 0, "deferred": 1}

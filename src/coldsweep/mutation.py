@@ -30,6 +30,7 @@ from contextlib import contextmanager
 from itertools import pairwise
 from pathlib import Path
 
+from . import syntax
 from .models import (
     Mutant,
     MutantResult,
@@ -42,7 +43,6 @@ from .models import (
 from .shard import paired_tests, resolve_scope, test_paths
 
 BACKUP_SUFFIX = ".coldsweep-mutant-backup"
-SENTINEL = b'raise ImportError("coldsweep harness sentinel")\n'
 
 COMPARISON = {
     "is not": "is", "not in": "in", "is": "is not", "in": "not in",
@@ -64,6 +64,8 @@ def invalidate_bytecode(path: Path) -> None:
     interpreter happily imports -- so the suite would then be judging the mutant, not the
     original. Deleting the cache entry is the only reliable answer.
     """
+    if path.suffix != ".py":
+        return  # no other language caches compiled output beside its source
     stem = path.stem
     cache = path.parent / "__pycache__"
     try:
@@ -73,6 +75,19 @@ def invalidate_bytecode(path: Path) -> None:
         path.with_suffix(".pyc").unlink(missing_ok=True)
     except OSError as exc:
         raise MutationError(f"{path}: cannot invalidate bytecode cache: {exc}") from exc
+
+
+def _sentinel_for(file: str) -> bytes:
+    """Content that makes a file fail to load, for the "do the tests touch this at all" probe.
+
+    What the probe proves differs by language, and the finding text says so. For Python the
+    sentinel raises on import, so a still-green suite never imported the module. For a compiled
+    language the sentinel fails the build, so a still-green suite never *built* the file -- a
+    weaker claim, but the same conclusion: mutants of it would survive for a reason that has
+    nothing to do with test quality.
+    """
+    language = syntax.language_for(file)
+    return language.sentinel if language is not None else syntax.PYTHON.sentinel
 
 
 def _line_starts(source: bytes) -> list[int]:
@@ -221,20 +236,42 @@ def mutant_id(file: str, anchor: str, operator: str, original: str, occurrence: 
     return f"m-{digest}"
 
 
-def generate_mutants(path: str, source: bytes, config: MutationConfig) -> list[Mutant]:
-    """Every mutation of one module, in source order. Deterministic, so rounds compare."""
+def _sites(path: str, source: bytes, config: MutationConfig) -> list[tuple[str, str, str, int, int]]:
+    """Raw ``(anchor, operator, replacement, start, end)`` tuples for one file.
+
+    Python goes through ``_Collector``, which is the reference implementation and the one every
+    published measurement was taken against. Everything else goes through tree-sitter, which
+    offers a narrower operator set on purpose -- see ``syntax.mutation_sites``.
+
+    A file whose extension names no configured language has nothing to mutate. It must not fall
+    through to the Python parser: doing so reports a Go file as unparseable Python, which reads
+    as a corrupt source rather than as a language this build does not cover.
+    """
+    language = syntax.language_for(path)
+    if language is None:
+        return []
+    if language is not syntax.PYTHON:
+        return [(_anchor_of(path, path_in_file.split("::")) if path_in_file else path,
+                 operator, mutated, start, end)
+                for path_in_file, operator, mutated, start, end
+                in syntax.mutation_sites(source, path, set(config.operators))]
     try:
         tree = ast.parse(source, filename=path)
     except SyntaxError as exc:
         raise MutationError(f"{path}: cannot parse for mutation: {exc}") from exc
-
     collector = _Collector(path, source, set(config.operators))
     collector.visit(tree)
+    return collector.found
+
+
+def generate_mutants(path: str, source: bytes, config: MutationConfig) -> list[Mutant]:
+    """Every mutation of one file, in source order. Deterministic, so rounds compare."""
+    found = _sites(path, source, config)
 
     seen: dict[tuple[str, str, str], int] = {}
     mutants: list[Mutant] = []
     per_anchor: dict[str, int] = {}
-    for anchor, operator, mutated, start, end in sorted(collector.found, key=lambda item: item[3]):
+    for anchor, operator, mutated, start, end in sorted(found, key=lambda item: item[3]):
         original = source[start:end].decode("utf-8", "replace")
         if original == mutated:
             continue
@@ -275,7 +312,10 @@ def build_mutation_shards(repo: Path, profile: Profile) -> list[MutationShard]:
     config = profile.mutation
     shards: list[MutationShard] = []
     for source in resolve_scope(repo, profile.scope):
-        if not source.endswith(".py"):
+        # A file whose language has no grammar installed yields no mutants, and a file with no
+        # mutants yields no shard. That is silence, not a clean result, so it is reported by
+        # `coldsweep languages` rather than left to look like a file nothing could go wrong in.
+        if not syntax.resolves(source):
             continue
         path = repo / source
         try:
@@ -373,10 +413,15 @@ class MutationCache:
         self.con.close()
 
 
-def run_tests(repo: Path, config: MutationConfig, tests: list[str],
-              timeout_s: int) -> tuple[int, str]:
-    """Run the configured test command over `tests`. Returns (exit code, tail of the output)."""
-    command = config.test_command.replace("{tests}", " ".join(shlex.quote(t) for t in tests))
+def run_tests(repo: Path, config: MutationConfig, tests: list[str], timeout_s: int,
+              command: str | None = None) -> tuple[int, str]:
+    """Run the configured test command over `tests`. Returns (exit code, tail of the output).
+
+    ``command`` overrides which command runs, so the build gate goes through the same process
+    handling -- timeout, environment, output tail -- as the suite it gates.
+    """
+    command = (command or config.test_command).replace(
+        "{tests}", " ".join(shlex.quote(t) for t in tests))
     # Never let a run leave bytecode behind for the next one to import.
     env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
     try:
@@ -512,6 +557,14 @@ class MutationRunner:
     def _run_tests(self, tests: list[str], timeout_s: int) -> tuple[int, str]:
         return run_tests(self.repo, self.config, tests, timeout_s)
 
+    def _builds(self) -> tuple[bool, str]:
+        """Whether the mutant currently in the tree compiles. ``(True, "")`` when unconfigured."""
+        if not self.config.build_command:
+            return True, ""
+        code, output = run_tests(self.repo, self.config, [], self.config.baseline_timeout_s,
+                                 command=self.config.build_command)
+        return code == 0, output
+
     def shard_key(self, shard: MutationShard) -> tuple[str, str, str, str]:
         """Everything that could change any verdict about this shard."""
         try:
@@ -540,7 +593,7 @@ class MutationRunner:
             original = path.read_bytes()
         except OSError as exc:
             raise MutationError(f"{shard.source}: cannot read for mutation: {exc}") from exc
-        with self._swapped(path, original, SENTINEL):
+        with self._swapped(path, original, _sentinel_for(shard.source)):
             code, _ = self._run_tests(shard.tests, self.config.timeout_s)
         self.cache.put_probe("sentinel", key, code != 0, "")
         return code != 0
@@ -596,6 +649,8 @@ class MutationRunner:
                 report.survived += 1
             elif result.outcome == "no_tests":
                 report.no_tests += 1
+            elif result.outcome == "not_built":
+                report.not_built += 1
             elif result.outcome == "error":
                 report.errors += 1
             else:
@@ -608,6 +663,13 @@ class MutationRunner:
         started = time.monotonic()
         try:
             with self._swapped(path, original, apply_mutant(original, mutant)):
+                built, build_output = self._builds()
+                if not built:
+                    # Never "killed": the suite never ran. Recording a rejected mutant as caught
+                    # would report the symbol as pinned by tests that never saw it.
+                    return MutantResult(mutant_id=mutant.id, outcome="not_built",
+                                        duration_s=time.monotonic() - started,
+                                        detail=build_output.strip()[:200])
                 code, output = self._run_tests(shard.tests, self.config.timeout_s)
         except OSError as exc:
             return MutantResult(mutant_id=mutant.id, outcome="error", detail=str(exc),
@@ -674,6 +736,15 @@ def run(repo: Path, profile: Profile, cache_path: Path,
             f"  files:   {', '.join(report.unexercised)}\n"
             "  Usually the suite is importing an installed copy of the package rather than "
             "this working tree. Fix the command before trusting any mutation result.")
+
+    # One rejected mutant is a mutation this language will not express. Every mutant rejected is
+    # a broken build command, and "no survivors" would then read as "the suite pins everything"
+    # when nothing was ever run against it.
+    if report.mutants and report.not_built == report.mutants:
+        raise MutationError(
+            "every mutant failed to build, so no mutant was ever judged by the suite.\n"
+            f"  build command: {config.build_command}\n"
+            "  Fix the build command before trusting any mutation result.")
 
     report.duration_s = round(time.monotonic() - started, 3)
     findings = [_finding(config, anchor, mutants) for anchor, mutants in sorted(survivors.items())]

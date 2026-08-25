@@ -400,6 +400,10 @@ class MutationConfig(BaseModel):
 
     rule_id: str
     test_command: str = "python -m pytest -q -x {tests}"
+    # Statically typed languages need the mutant compiled before the suite runs: a build failure
+    # and a test failure both exit non-zero, so without this a rejected mutant reads as killed
+    # and the symbol is reported as tested when nothing tested it. Left unset, no build is run.
+    build_command: str | None = None
     test_patterns: list[str] = Field(default_factory=lambda: ["tests/test_{stem}.py"])
     operators: list[str] = Field(
         default_factory=lambda: ["comparison", "arithmetic", "boolean", "constant", "return"])
@@ -544,7 +548,7 @@ class MutantResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     mutant_id: str
-    outcome: Literal["killed", "survived", "timeout", "no_tests", "error"]
+    outcome: Literal["killed", "survived", "timeout", "no_tests", "not_built", "error"]
     duration_s: float = 0.0
     detail: str = ""
 
@@ -552,6 +556,16 @@ class MutantResult(BaseModel):
     def survived(self) -> bool:
         """A timeout means the mutant was detected by hanging the suite -- that counts as killed."""
         return self.outcome in ("survived", "no_tests")
+
+    @property
+    def decided(self) -> bool:
+        """Whether this mutant is evidence about the tests at all.
+
+        ``not_built`` is not. A mutant the compiler rejects was never run, so it says nothing
+        about what the suite would have caught, and counting it as killed would report a symbol
+        as pinned by tests that never saw it.
+        """
+        return self.outcome != "not_built"
 
 
 class MutationShard(BaseModel):
@@ -637,6 +651,7 @@ class MutationReport(BaseModel):
     killed: int = 0
     survived: int = 0
     no_tests: int = 0
+    not_built: int = 0
     errors: int = 0
     cached: int = 0
     probes_cached: int = 0
