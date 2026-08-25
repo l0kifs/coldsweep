@@ -716,10 +716,40 @@ A second cost: 29 adjudication calls, **$6.03**, of which 28 ruled "different". 
 band is entirely spurious for this rule class.
 
 **Fixed** — the similarity fallback and the adjudication call are skipped for any rule marked
-`decided_by: code`. Such a rule is exhaustive and its anchors are machine-derived, so two
+`decided_by: code`, and replayed against the saved scan output below. Such a rule is exhaustive and its anchors are machine-derived, so two
 anchors are two work items by construction: there is no differently-phrased duplicate for the
 fallback to catch, and nothing for it to do but lose things. Exact identity matching is
 untouched, so a re-derived finding still merges.
+
+### The repaired merge, replayed
+
+Re-running the task would cost another $63 and would not isolate the change: with 43 findings
+instead of 34 the fix phase does different work, so the counts would differ for two reasons at
+once. The raw scan output for all three rounds is committed, so the merge can be replayed
+against it instead — same input, repaired code, no agent calls.
+
+| Round 1, identical input | Before | After |
+|---|---|---|
+| Ingested | 44 | 44 |
+| New findings | 34 | **43** |
+| Exact identity matches | 1 | 1 |
+| Fuzzy auto-merges | **9** | **0** |
+| Adjudication calls | 25 | **0** |
+
+Nine work items in round one, recovered. Across all three rounds the repaired merge makes
+**zero** adjudication calls, against 29 costing $6.03 — every one of them was on an
+`untested-behaviour` pair, so the fix removes that spend entirely rather than reducing it.
+
+The replayed run ends with 39 distinct `untested-behaviour` findings, which is exactly the 39
+survivors the mutation subsystem reported in round 1. Merge now preserves an exhaustive
+subsystem's answer one for one, which is the property it should never have lacked.
+
+**What the replay does not show.** Round 1 is an exact counterfactual: same input, one code
+change. Rounds 2 and 3 are not — their scan output was produced against a tree the *old* run had
+already fixed, and a fix phase given 43 work items instead of 34 would have edited different
+files and cost more. Closure rates, dispute counts and the $63.30 are not re-measured here, and
+this section makes no claim about them. Round 3's 18 stale closures are an artefact of replaying
+without a fix phase and mean nothing.
 
 ### Limits of run 3
 
