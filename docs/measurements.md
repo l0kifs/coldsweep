@@ -773,8 +773,19 @@ without a fix phase and mean nothing.
   two fixes above. That makes it a fair test of the machinery and a poor test of a *typical*
   module: new code has thinner tests than settled code, so 39 unpinned symbols from four files
   should not be read as a rate.
-- Its 15 disputes are unadjudicated. Nothing here says whether they are real work or the
-  oscillation guard giving up on findings that a fix agent cannot pin in three attempts.
+- Its 15 disputes were left unadjudicated by the run, and were then checked against a
+  re-derived survivor set. **12 of the 14 under a `decided_by: code` rule are still genuinely
+  unpinned** — they are work, not noise. All six the *oscillation guard* raised are among them,
+  6 of 6: the guard stopped re-fixing symbols a fix agent had failed to pin three times running,
+  and it was right about every one. The two stale disputes were both raised by the fix *agent*
+  arguing the test already existed, and both symbols were pinned by later work. The fifteenth is
+  under an agent-decided rule, where mutation has no opinion either way.
+- That check is one nothing in the tool performs. A dispute on a rule a subsystem decides is
+  settleable by code — the exhaustive re-derivation already answers it — but `coldsweep
+  adjudicate` treats every dispute as a human judgement and, non-interactively, can only accept
+  all of them at once. Accepting these fifteen would open the gate over twelve unpinned symbols.
+  It is the same category error as defects 10 and 11, in a third place: a subsystem-decided rule
+  handled as though an agent decided it.
 
 ---
 
