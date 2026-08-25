@@ -6,7 +6,7 @@ from conftest import make_round
 
 from coldsweep.converge import ConvergenceReport, evaluate, open_blocking, status_counts
 from coldsweep.merge import merge_round
-from coldsweep.models import Finding
+from coldsweep.models import Finding, Profile, RawFinding
 
 
 def f(**kw) -> Finding:
@@ -151,3 +151,76 @@ def test_a_report_built_directly_defaults_to_a_shut_gate(profile):
 def test_status_counts_returns_exactly_the_three_axes(profile):
     counts = status_counts([f(status="open")])
     assert set(counts) == {"status", "rule", "source"}
+
+
+# --- the two halves --------------------------------------------------------
+
+def _split_profile() -> Profile:
+    """A profile mixing a rule a subsystem decides with one an agent decides."""
+    return Profile.model_validate({
+        "version": 1, "name": "split",
+        "scope": {"include": ["src/**/*.py"]},
+        "convergence": {"k": 2, "max_rounds": 8},
+        "rules": [
+            {"id": "unimplemented-spec-item", "mode": "presence", "decided_by": "code",
+             "description": "d"},
+            {"id": "vacuous-implementation", "mode": "presence", "description": "d"},
+        ],
+    })
+
+
+def _at(rule: str, anchor: str, first: int, last: int, status: str = "verified"):
+    f = RawFinding(rule_id=rule, anchor=anchor, evidence=None, description="d").to_finding("s", first)
+    f.last_seen_round, f.status = last, status
+    return f
+
+
+def test_the_decidable_half_can_converge_while_the_budgeted_half_plateaus():
+    """The measured shape of a `features` run: the spec items settle, the agent rule does not.
+
+    One verdict over both halves reports "not converged" and loses the fact that the half with a
+    real answer already has one.
+    """
+    findings = [
+        _at("unimplemented-spec-item", "SPEC.md::FR-1", 1, 1),
+        _at("vacuous-implementation", "src/a.py::f", 3, 3, status="open"),
+    ]
+    report = evaluate(findings, _split_profile(), [1, 2, 3])
+    assert not report.converged
+    assert report.decidable.converged
+    assert not report.budgeted.converged
+    assert report.budgeted.open_ids
+
+
+def test_a_half_measures_its_own_quiet_window():
+    """New findings under the other half's rules must not disturb this half's window."""
+    findings = [_at("vacuous-implementation", "src/a.py::f", 3, 3)]
+    report = evaluate(findings, _split_profile(), [1, 2, 3])
+    assert report.decidable.new_per_round == {"1": 0, "2": 0, "3": 0}
+    assert report.budgeted.new_per_round["3"] == 1
+
+
+def test_a_half_with_no_rules_is_not_converged():
+    """An empty half has no answer. Reporting 0 would gate open on a taxonomy that cannot fail."""
+    profile = _split_profile()
+    profile.rules = [r for r in profile.rules if r.decided_by == "agent"]
+    report = evaluate([], profile, [1, 2])
+    assert report.decidable.empty and not report.decidable.converged
+    assert report.budgeted.converged
+
+
+def test_an_unadjudicated_dispute_shuts_its_own_half():
+    findings = [_at("unimplemented-spec-item", "SPEC.md::FR-1", 1, 1, status="disputed")]
+    report = evaluate(findings, _split_profile(), [1, 2, 3])
+    assert not report.decidable.converged
+    assert report.decidable.disputed_pending_ids
+    assert report.budgeted.converged
+
+
+def test_unclassified_findings_belong_to_neither_half():
+    """An off-taxonomy rule id is gated globally; it must not silently shut a half."""
+    findings = [_at("invented-rule", "src/a.py::f", 1, 1)]
+    report = evaluate(findings, _split_profile(), [1, 2, 3])
+    assert report.unclassified_ids
+    assert report.decidable.converged and report.budgeted.converged
+    assert not report.converged

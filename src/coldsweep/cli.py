@@ -13,7 +13,7 @@ from typing import Annotated
 import typer
 from pydantic import ValidationError
 
-from . import converge, mechanical, merge, mutation, store, verify
+from . import converge, mechanical, merge, mutation, store, syntax, verify
 from . import spec as spec_mod
 from .models import (
     Finding,
@@ -236,6 +236,30 @@ def shard(
     typer.echo(f"\n{len(shards)} shard(s), {sum(len(s.files) for s in shards)} file(s)", err=True)
 
 
+@app.command()
+def languages(
+    as_json: Annotated[bool, typer.Option("--json", help="Emit the support table as JSON.")] = False,
+) -> None:
+    """Which languages resolve to symbols here, and which need a grammar installed.
+
+    Worth running before trusting a non-Python task. A language without its grammar is not an
+    error anywhere -- `verify` defers instead of deciding, and mutation skips the file -- so the
+    only symptom is work quietly not happening. This is where that becomes visible.
+    """
+    rows = syntax.support()
+    if as_json:
+        typer.echo(json.dumps([{"language": n, "extensions": e.split(), "available": ok}
+                               for n, e, ok in rows], indent=2))
+        return
+    for name, extensions, available in rows:
+        mark = "yes" if available else "no"
+        colour = typer.colors.GREEN if available else typer.colors.YELLOW
+        typer.secho(f"{mark:4} {name:12} {extensions}", fg=colour)
+    missing = [name for name, _, ok in rows if not ok]
+    if missing:
+        typer.echo("\ninstall the missing grammars with:  uv add coldsweep[languages]", err=True)
+
+
 def _run_subsystems(paths: Paths, profile: Profile, n: int) -> list[RawFinding]:
     """Every deterministic subsystem this profile runs, into one list.
 
@@ -262,7 +286,8 @@ def _run_subsystems(paths: Paths, profile: Profile, n: int) -> list[RawFinding]:
                         fg=typer.colors.YELLOW, err=True)
         typer.echo(f"round {n}: mutation {report.mutants} mutant(s) over {report.shards} file(s) "
                    f"-- killed {report.killed}, survived {report.survived}, "
-                   f"no tests {report.no_tests}, cached {report.cached}, {report.duration_s}s")
+                   f"no tests {report.no_tests}, not built {report.not_built}, "
+                   f"cached {report.cached}, {report.duration_s}s")
     return out
 
 
@@ -450,7 +475,7 @@ def mutants(
         return
     typer.echo(f"{report.mutants} mutant(s) over {report.shards} file(s) in {report.duration_s}s")
     typer.echo(f"  killed {report.killed}   survived {report.survived}   no tests {report.no_tests}"
-               f"   errors {report.errors}")
+               f"   not built {report.not_built}   errors {report.errors}")
     typer.echo(f"  cache hits {report.cached} mutant(s), {report.probes_cached} whole-suite run(s)"
                f"   skipped after first survivor {report.skipped}")
     for source in report.unexercised:
@@ -655,7 +680,8 @@ def verify_cmd(
     """Re-check fixed findings against evidence_sha."""
     paths, profile, findings = _load(repo, task)
     n = max([*store.completed_rounds(paths), 0])
-    stats = verify.verify_findings(paths.repo, profile, findings, n)
+    stats = verify.verify_findings(paths.repo, profile, findings, n,
+                                   paths.mutants, paths.mutation_lock)
     _save_findings(paths, profile, findings)
     typer.echo(f"verified {stats['verified']}, reopened {stats['reopened']}, "
                f"deferred to next round {stats['deferred']}")
@@ -749,26 +775,67 @@ def status(
         typer.secho("\nnot converged", fg=typer.colors.YELLOW)
         for reason in report.reasons:
             typer.echo(f"  - {reason}")
+    _report_halves(report)
+
+
+def _report_halves(report: converge.ConvergenceReport) -> None:
+    """The two halves of the taxonomy, separately.
+
+    A profile whose rules are all agent-decided has nothing to split, so it prints nothing: the
+    global verdict already says everything there is to say. The split earns its line only where
+    a deterministic decider sits next to a plateauing one and the single verdict would let the
+    plateau hide an answer that is already settled.
+    """
+    if report.decidable.empty or report.budgeted.empty:
+        return
+    typer.echo("")
+    for half in (report.decidable, report.budgeted):
+        verdict = "converged" if half.converged else "not converged"
+        colour = typer.colors.GREEN if half.converged else typer.colors.YELLOW
+        typer.secho(f"  {half.label:<10} {verdict:<14} "
+                    f"{len(half.rule_ids)} rule(s), {half.quiet_rounds} quiet round(s)", fg=colour)
+        for reason in half.reasons:
+            typer.echo(f"    - {reason}")
 
 
 @app.command()
 def converged(
     task: Annotated[str, _task_opt()],
     repo: Annotated[Path | None, _repo_opt()] = None,
+    half: Annotated[str | None, typer.Option(
+        "--half", help="Gate on one half of the taxonomy: 'decidable' or 'budgeted'.")] = None,
 ) -> None:
     """Exit 0 if converged, 1 otherwise. Prints nothing on those outcomes -- this is the gate.
 
+    ``--half decidable`` gates on the rules a subsystem decides. Those are exhaustive over their
+    scope and return the same set every pass, so their window closing is an answer rather than a
+    budget running out. On a profile that mixes them with agent-decided rules the global gate
+    can never open -- measured twice on this repository, the agent half was still producing new
+    findings in the last round of every run -- and a caller that wants the decidable answer would
+    otherwise have to parse `status`.
+
     A genuine failure to evaluate (corrupt findings, bad scope, ...) is not the same as an
     unconverged task: it is reported on stderr and exits 2, so a caller can tell "not done yet"
-    from "could not tell".
+    from "could not tell". Naming a half that no rule falls into is the same kind of failure: it
+    exits 2 rather than reporting a vacuous 0.
     """
+    if half is not None and half not in ("decidable", "budgeted"):
+        _fail(f"unknown half {half!r}: expected 'decidable' or 'budgeted'")
+        return
     try:
         paths, profile, findings = _load(repo, task)
         report = _evaluate(paths, profile, findings)
     except (StoreError, ShardError, spec_mod.SpecError) as exc:
         _fail(f"could not evaluate convergence: {exc}")
         return
-    raise typer.Exit(0 if report.converged else 1)
+    if half is None:
+        raise typer.Exit(0 if report.converged else 1)
+    chosen: converge.HalfReport = (report.decidable if half == "decidable"
+                                   else report.budgeted)
+    if chosen.empty:
+        _fail(f"no rule in this profile is in the {half} half; there is nothing to gate on")
+        return
+    raise typer.Exit(0 if chosen.converged else 1)
 
 
 @app.command()

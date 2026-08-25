@@ -11,6 +11,34 @@ from pydantic import BaseModel, ConfigDict, Field
 from .models import Finding, Profile, SpendRecord
 
 
+class HalfReport(BaseModel):
+    """Convergence over one half of a profile's taxonomy, read on its own.
+
+    A rule a subsystem decides is exhaustive over its scope and returns the same set every pass,
+    so its quiet window closes and the answer means something. A rule an agent decides samples
+    from a large space of defensible observations and plateaus instead, so its window is a
+    budget. Reporting one number over both halves lets the plateau hide the answer: measured on
+    this repository, the deterministic half of a `features` task settled in three rounds while
+    the agent half was still producing a finding a round at the stop.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    label: str
+    rule_ids: list[str] = Field(default_factory=list)
+    converged: bool = False
+    quiet_rounds: int = 0
+    new_per_round: dict[str, int] = Field(default_factory=dict)
+    open_ids: list[str] = Field(default_factory=list)
+    disputed_pending_ids: list[str] = Field(default_factory=list)
+    reasons: list[str] = Field(default_factory=list)
+
+    @property
+    def empty(self) -> bool:
+        """A half no rule falls into. Neither converged nor unconverged -- it does not exist."""
+        return not self.rule_ids
+
+
 class ConvergenceReport(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -26,6 +54,10 @@ class ConvergenceReport(BaseModel):
     disputed_pending_ids: list[str] = Field(default_factory=list)
     unclassified_ids: list[str] = Field(default_factory=list)
     reasons: list[str] = Field(default_factory=list)
+    # Plain model defaults, not a `default_factory` lambda: pydantic deep-copies these per
+    # instance, and static analysis can see the type through them where it cannot through a lambda.
+    decidable: HalfReport = HalfReport(label="decidable")
+    budgeted: HalfReport = HalfReport(label="budgeted")
 
 
 def is_unclassified(finding: Finding, profile: Profile) -> bool:
@@ -122,6 +154,14 @@ def evaluate(findings: list[Finding], profile: Profile, rounds: list[int],
     # off-taxonomy finding. Once those are all that is left, another round buys nothing.
     needs_triage = bool(rounds_settled and not op and (dp or uc) and not external)
 
+    # Both halves are measured over the same rounds and the same k. Only the rule set differs,
+    # so a half's window is genuinely its own and not a slice of the global verdict.
+    halves = {
+        label: _half(label, ids, findings, rounds, partial, k)
+        for label, ids in (("decidable", {r.id for r in profile.rules if r.decided_by == "code"}),
+                           ("budgeted", {r.id for r in profile.rules if r.decided_by == "agent"}))
+    }
+
     return ConvergenceReport(
         converged=not reasons,
         needs_triage=needs_triage,
@@ -134,6 +174,62 @@ def evaluate(findings: list[Finding], profile: Profile, rounds: list[int],
         open_ids=sorted(f.id for f in op),
         disputed_pending_ids=sorted(f.id for f in dp),
         unclassified_ids=sorted(f.id for f in uc),
+        reasons=reasons,
+        decidable=halves["decidable"],
+        budgeted=halves["budgeted"],
+    )
+
+
+def _half(label: str, rule_ids: set[str], findings: list[Finding], rounds: list[int],
+          partial: set[int], k: int) -> HalfReport:
+    """Convergence over one subset of the taxonomy.
+
+    Unclassified findings are absent by construction -- an off-taxonomy rule id belongs to
+    neither half -- so they are gated globally and nowhere here. External blockers are global
+    too: a drifted spec is not a property of one half's rules.
+    """
+    mine = [f for f in findings if f.rule_id in rule_ids]
+    counts = new_per_round(mine, rounds)
+    tail = rounds[-k:] if len(rounds) >= k else rounds
+
+    def is_quiet(r: int) -> bool:
+        return counts[r] == 0 and r not in partial
+
+    quiet = 0
+    for r in reversed(rounds):
+        if is_quiet(r):
+            quiet += 1
+        else:
+            break
+
+    op = [f for f in mine if f.status in ("open", "fixed")]
+    dp = [f for f in mine if f.status == "disputed" and not f.adjudicated]
+
+    reasons: list[str] = []
+    if not rule_ids:
+        reasons.append("no rules in this half")
+    elif len(rounds) < k:
+        reasons.append(f"only {len(rounds)} round(s) completed, need at least k={k}")
+    else:
+        noisy = ", ".join(f"round {r}: +{counts[r]}" for r in tail if counts[r])
+        if noisy:
+            reasons.append(f"new findings inside the last {k} round(s) ({noisy})")
+        blind = ", ".join(str(r) for r in tail if r in partial)
+        if blind:
+            reasons.append(f"round(s) {blind} inside the last {k} were ingested with failed shards")
+    if op:
+        reasons.append(f"{len(op)} finding(s) still open or awaiting verification")
+    if dp:
+        reasons.append(f"{len(dp)} disputed finding(s) not adjudicated")
+
+    return HalfReport(
+        label=label,
+        rule_ids=sorted(rule_ids),
+        converged=bool(rule_ids) and not reasons,
+        quiet_rounds=quiet,
+        new_per_round={str(r): c for r, c in counts.items()},
+        open_ids=sorted(f.id for f in op),
+        disputed_pending_ids=sorted(f.id for f in dp),
         reasons=reasons,
     )
 

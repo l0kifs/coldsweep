@@ -362,3 +362,76 @@ def test_any_command_recovers_a_tree_a_killed_mutation_run_left_mutated(project:
     assert result.returncode == 0
     assert "a mutation run was interrupted" in result.stderr
     assert source.read_text() == original and not paths.mutation_lock.exists()
+
+
+# --- language support and the split gate -----------------------------------
+
+SPLIT_RULES = [
+    {"id": "unimplemented-spec-item", "mode": "presence", "decided_by": "code",
+     "description": "A frozen spec item nothing claims to implement."},
+    {"id": "swallowed-exception", "mode": "absence",
+     "description": "An except block that discards the error."},
+]
+
+
+def test_languages_reports_what_resolves():
+    """A missing grammar has no error path anywhere -- this is where it becomes visible."""
+    result = subprocess.run([sys.executable, "-m", "coldsweep", "languages", "--json"],
+                            cwd=ROOT, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    rows = {r["language"]: r for r in json.loads(result.stdout)}
+    assert rows["python"]["available"] is True
+    assert ".cs" in rows["c_sharp"]["extensions"]
+
+
+def test_the_gate_can_be_asked_about_one_half(project: Path):
+    """The global gate cannot open while an agent rule keeps producing findings.
+
+    Every measured run ended that way, so a caller that wants the answer the deterministic half
+    already reached has to be able to ask for it directly.
+    """
+    paths = init(project, rules=SPLIT_RULES)
+    store.save_findings(paths, [])
+    for n in (1, 2):
+        (paths.runs / f"{n}.json").write_text(json.dumps({
+            "round": n,
+            "shards": [{"shard": "s1", "files": ["src/loader.py"], "ok": True, "source": "agent",
+                        "findings": [{"rule_id": "swallowed-exception",
+                                      "anchor": f"src/loader.py::load{n}",
+                                      "evidence": "except OSError:\n    pass",
+                                      "description": "d"}]}],
+        }))
+        assert coldsweep(project, "ingest", str(paths.runs / f"{n}.json")).returncode == 0
+
+    assert coldsweep(project, "converged").returncode == 1
+    assert coldsweep(project, "converged", "--half", "decidable").returncode == 0
+    assert coldsweep(project, "converged", "--half", "budgeted").returncode == 1
+
+
+def test_gating_on_a_half_no_rule_falls_into_is_an_error_not_a_pass(project: Path):
+    """Exit 0 there would report an answer about a taxonomy that has no way to fail."""
+    init(project, rules=[SPLIT_RULES[1]])
+    result = coldsweep(project, "converged", "--half", "decidable")
+    assert result.returncode == 2
+    assert "nothing to gate on" in result.stderr
+
+
+def test_an_unknown_half_is_refused(project: Path):
+    init(project)
+    result = coldsweep(project, "converged", "--half", "nonsense")
+    assert result.returncode == 2 and "expected" in result.stderr
+
+
+def test_status_prints_both_halves_when_a_profile_has_both(project: Path):
+    paths = init(project, rules=SPLIT_RULES)
+    store.save_findings(paths, [])
+    out = coldsweep(project, "status").stdout
+    assert "decidable" in out and "budgeted" in out
+
+
+def test_status_omits_the_split_when_every_rule_is_agent_decided(project: Path):
+    """Nothing to split, so the line would be noise repeating the global verdict."""
+    paths = init(project)
+    store.save_findings(paths, [])
+    out = coldsweep(project, "status").stdout
+    assert "decidable" not in out
