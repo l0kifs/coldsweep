@@ -128,6 +128,70 @@ def _rederive_unpinned(repo: Path, profile: Profile, cache: Path | None,
     return {raw.anchor for raw in survivors}
 
 
+def settle_disputes(repo: Path, profile: Profile, findings: list[Finding], round_no: int,
+                    mutants_cache: Path | None = None,
+                    mutation_lock: Path | None = None) -> dict[str, int]:
+    """Decide the disputes a subsystem can decide, before a human is asked anything.
+
+    A dispute under a `decided_by: code` rule contains a factual question the deciding subsystem
+    already answers exhaustively: is this anchor still reported? Asking a person is asking them
+    to re-derive by hand what the tool re-derives in one pass.
+
+    Only the *settled* half is closed here. An anchor the subsystem no longer reports is
+    ``verified`` -- the objection was right and the work is done. An anchor it still reports is
+    left disputed and still pending, annotated with the confirmation, because "the fix phase
+    tried three times and failed" is not a question about facts. Whether to keep paying for it
+    is a policy call, and the gate must not open over a symbol nothing pins on the strength of a
+    re-derivation that says exactly the opposite.
+
+    Reopening those instead would be worse than leaving them: the oscillation guard disputed
+    them precisely to stop the fix phase cycling on them, and reopening reinstates the cycle.
+    """
+    stats = {"verified": 0, "confirmed": 0, "undecidable": 0}
+    # Which rules a subsystem owns, taken from the subsystem configs rather than from
+    # `decided_by`. The two can disagree on a misconfigured profile, and the config that names
+    # the rule is the one that can actually answer for it -- `verify_findings` reads the same
+    # source, so a finding cannot be decidable in one pass and undecidable in the other.
+    spec_rule = profile.spec.unimplemented_rule_id if profile.spec else None
+    mutation_rule = profile.mutation.rule_id if profile.mutation else None
+    owned = {r for r in (spec_rule, mutation_rule) if r}
+    pending = [f for f in findings
+               if f.status == "disputed" and not f.adjudicated and f.rule_id in owned]
+    if not pending:
+        return stats
+
+    implemented: set[str] | None = None
+    if spec_rule and any(f.rule_id == spec_rule for f in pending):
+        try:
+            implemented = implemented_items(repo, profile)
+        except (ShardError, SpecError):
+            implemented = None
+    unpinned: set[str] | None = None
+    if mutation_rule and any(f.rule_id == mutation_rule for f in pending):
+        unpinned = _rederive_unpinned(repo, profile, mutants_cache, mutation_lock)
+
+    for f in pending:
+        if f.rule_id == spec_rule:
+            settled, still_open = implemented is not None, _spec_item_of(f) not in (implemented or ())
+            why = f"{_spec_item_of(f)} is marked by an implementation in scope"
+        else:  # the only other member of `owned`
+            settled, still_open = unpinned is not None, f.anchor in (unpinned or ())
+            why = f"no mutation of {f.anchor} survives the suite"
+        if not settled:
+            stats["undecidable"] += 1
+            continue
+        if still_open:
+            stats["confirmed"] += 1
+            f.log(round_no, "adjudicated", method="stale",
+                  detail="re-derived: still reported, so the dispute is about effort, not fact")
+            continue
+        stats["verified"] += 1
+        f.status = "verified"
+        f.adjudicated = True
+        f.log(round_no, "verify", detail=f"dispute settled by re-derivation: {why}")
+    return stats
+
+
 def verify_findings(repo: Path, profile: Profile, findings: list[Finding], round_no: int,
                     mutants_cache: Path | None = None,
                     mutation_lock: Path | None = None) -> dict[str, int]:

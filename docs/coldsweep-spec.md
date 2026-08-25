@@ -373,3 +373,24 @@ unchanged and is what merges a re-derived finding across rounds.
 
 The fallback exists because *agents* phrase the same finding differently every run. Applying it
 where nothing is phrased was the error.
+
+## 21. Amendment: a dispute a subsystem can decide is not triage
+
+§12 makes `adjudicate` interactive triage for every dispute. For a rule a subsystem owns, half
+of that is a factual question the subsystem already answers exhaustively, and asking a person is
+asking them to re-derive by hand what one pass re-derives.
+
+`adjudicate` now settles those first. Anchor no longer reported → `verified`, adjudicated, no
+prompt. Anchor still reported → left disputed and still pending, annotated with the
+confirmation. That half is deliberately *not* closed: the gate must not open over a symbol the
+decider says nothing pins, and reopening it instead would restart the cycle the oscillation
+guard exists to stop. What remains is a policy call — keep paying, or `wontfix` — which is what
+a person is for.
+
+The settleable set comes from the subsystem configs (`mutation.rule_id`,
+`spec.unimplemented_rule_id`), not from `decided_by`. The two can disagree on a misconfigured
+profile, and `verify` reads the same source, so a finding cannot be decidable in one pass and
+undecidable in the other.
+
+Measured (docs/measurements.md, run 3): of 15 disputes, 2 settled without asking, 12 confirmed
+as real work, 1 left to a person because mutation has no opinion about an agent-decided rule.

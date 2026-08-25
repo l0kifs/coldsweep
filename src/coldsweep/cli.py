@@ -847,13 +847,28 @@ def adjudicate(
     accept_disputes: Annotated[bool, typer.Option("--accept-disputes",
         help="Non-interactive: accept every pending dispute as adjudicated.")] = False,
 ) -> None:
-    """Interactive triage of disputed and unclassified findings."""
+    """Triage disputed and unclassified findings, asking only what a person has to decide.
+
+    A dispute under a `decided_by: code` rule is settled against the deciding subsystem first.
+    The half it can close it closes; the half it cannot -- a symbol still reported, where the
+    disagreement is about how much more to spend rather than about a fact -- reaches the prompt
+    with the re-derivation attached.
+    """
     paths, profile, findings = _load(repo, task)
     n = max([*store.completed_rounds(paths), 0])
     unclassified = converge.unclassified_pending(findings, profile)
+    if converge.disputed_pending(findings):
+        settled = verify.settle_disputes(paths.repo, profile, findings, n,
+                                         paths.mutants, paths.mutation_lock)
+        if any(settled.values()):
+            typer.echo(f"re-derived: {settled['verified']} settled as done, "
+                       f"{settled['confirmed']} confirmed still open, "
+                       f"{settled['undecidable']} could not be re-derived")
+        if settled["verified"]:
+            _save_findings(paths, profile, findings)
     disputes = converge.disputed_pending(findings)
     if not unclassified and not disputes:
-        typer.echo("nothing to adjudicate")
+        typer.echo("nothing left to adjudicate")
         return
 
     profile, touched = _triage_unclassified(paths, profile, unclassified, n, wontfix_unclassified)

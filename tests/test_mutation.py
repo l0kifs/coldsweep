@@ -23,7 +23,7 @@ from coldsweep.mutation import (
     restore_interrupted,
     run,
 )
-from coldsweep.verify import verify_findings
+from coldsweep.verify import settle_disputes, verify_findings
 
 SOURCE = '''"""Module docstring, not behaviour."""
 
@@ -593,3 +593,65 @@ def test_the_sweep_is_skipped_when_no_candidate_needs_it(project: Path):
     stats = verify_findings(project, profile(test_command="exit 7"), [other], 2,
                             project / "cache.sqlite", project / "mutants.lock")
     assert stats == {"verified": 0, "reopened": 0, "deferred": 1}
+
+
+# --- a dispute a subsystem can settle is not a question for a person --------
+
+def _disputed(anchor: str, rule: str = "untested-behaviour", adjudicated: bool = False):
+    f = RawFinding(rule_id=rule, anchor=anchor, evidence=None,
+                   description="d").to_finding("s", 1)
+    f.status, f.adjudicated = "disputed", adjudicated
+    return f
+
+
+def _settle(project: Path, findings, **kw):
+    return settle_disputes(project, profile(**kw), findings, 3,
+                           project / "cache.sqlite", project / "mutants.lock")
+
+
+def test_a_dispute_the_suite_has_since_answered_is_settled_without_asking(project: Path):
+    """The objection was right and the work is done; a person adds nothing to that."""
+    (project / "tests" / "test_port.py").write_text(STRONG_TEST)
+    findings = [_disputed("src/port.py::parse_port")]
+    stats = _settle(project, findings, stop_at_first_survivor=False)
+    assert stats["verified"] == 1
+    assert findings[0].status == "verified" and findings[0].adjudicated
+
+
+def test_a_dispute_the_suite_still_contradicts_stays_a_question_for_a_person(project: Path):
+    """Confirming the fact does not answer the question.
+
+    The oscillation guard disputed it to stop the fix phase cycling; reopening on evidence that
+    says the symbol is still unpinned reinstates exactly that cycle. What is left is a policy
+    call -- keep paying, or retire it -- and the gate must not open over it either way.
+    """
+    (project / "tests" / "test_port.py").write_text(VACUOUS_TEST)
+    findings = [_disputed("src/port.py::parse_port")]
+    stats = _settle(project, findings)
+    assert stats == {"verified": 0, "confirmed": 1, "undecidable": 0}
+    assert findings[0].status == "disputed" and not findings[0].adjudicated
+    assert "about effort, not fact" in findings[0].history[-1].detail
+
+
+def test_an_agent_decided_dispute_is_left_alone(project: Path):
+    """Mutation has no opinion about a rule it does not decide, and must not act as if it does."""
+    (project / "tests" / "test_port.py").write_text(STRONG_TEST)
+    findings = [_disputed("src/port.py::parse_port", rule="vacuous-test")]
+    stats = _settle(project, findings, stop_at_first_survivor=False)
+    assert stats == {"verified": 0, "confirmed": 0, "undecidable": 0}
+    assert findings[0].status == "disputed" and not findings[0].adjudicated
+
+
+def test_an_already_adjudicated_dispute_is_not_reopened_by_evidence(project: Path):
+    """A ruling already made is not re-litigated; that is what `adjudicated` means."""
+    (project / "tests" / "test_port.py").write_text(VACUOUS_TEST)
+    findings = [_disputed("src/port.py::parse_port", adjudicated=True)]
+    assert _settle(project, findings) == {"verified": 0, "confirmed": 0, "undecidable": 0}
+    assert findings[0].status == "disputed"
+
+
+def test_a_subsystem_that_cannot_run_settles_nothing(project: Path):
+    (project / "tests" / "test_port.py").write_text("def test_broken():\n    assert False\n")
+    findings = [_disputed("src/port.py::parse_port")]
+    assert _settle(project, findings) == {"verified": 0, "confirmed": 0, "undecidable": 1}
+    assert findings[0].status == "disputed" and not findings[0].adjudicated

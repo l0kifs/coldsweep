@@ -780,12 +780,14 @@ without a fix phase and mean nothing.
   and it was right about every one. The two stale disputes were both raised by the fix *agent*
   arguing the test already existed, and both symbols were pinned by later work. The fifteenth is
   under an agent-decided rule, where mutation has no opinion either way.
-- That check is one nothing in the tool performs. A dispute on a rule a subsystem decides is
-  settleable by code — the exhaustive re-derivation already answers it — but `coldsweep
-  adjudicate` treats every dispute as a human judgement and, non-interactively, can only accept
-  all of them at once. Accepting these fifteen would open the gate over twelve unpinned symbols.
-  It is the same category error as defects 10 and 11, in a third place: a subsystem-decided rule
-  handled as though an agent decided it.
+- That check was one nothing in the tool performed — the same category error as defects 10 and
+  11, in a third place: a subsystem-decided rule handled as though an agent decided it.
+  **Fixed.** `coldsweep adjudicate` now settles such disputes against the decider first, and run
+  against this task's fifteen it reports `2 settled as done, 12 confirmed still open, 0 could
+  not be re-derived` — reproducing by machine the classification above. The 12 stay pending on
+  purpose: the gate must not open over symbols the decider says nothing pins, and reopening them
+  would restart the cycle the oscillation guard exists to stop. What is left for a person is a
+  policy call, which is the only part that ever needed one.
 
 ---
 

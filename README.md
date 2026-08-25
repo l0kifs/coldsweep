@@ -84,7 +84,7 @@ a previous task's history.
 | `coldsweep status [--json]` | Counts by status and rule; unclassified and disputed; what the task has spent |
 | `coldsweep converged [--half H]` | Exit 0/1, no output. `--half decidable` gates on the rules a subsystem decides |
 | `coldsweep languages` | Which languages resolve to symbols here, and which need a grammar |
-| `coldsweep adjudicate` | Triage disputed and unclassified findings |
+| `coldsweep adjudicate` | Triage disputed and unclassified findings; settles subsystem-decided disputes against re-derived evidence first |
 | `coldsweep run` | The full loop until converged or `max_rounds` |
 
 All of them except `task list` and `languages` take `--task`/`-t`.
@@ -147,6 +147,14 @@ anchor names and confirms the offending snippet is gone; that is `verified`. A f
 consecutive scans simply stopped re-deriving is `lapsed` — closed, but nothing inspected the
 repository to close it. `coldsweep status` counts them separately, so a green run shows how
 much of its green came from evidence.
+
+**Disputes** — a dispute under a rule a subsystem owns is settled against that subsystem before
+anyone is asked. An anchor it no longer reports is `verified`: the objection was right and the
+work is done. An anchor it still reports stays disputed and still pending, annotated with the
+re-derivation, because "three fix attempts failed" is a question about effort, not fact — and
+the gate must not open over a symbol nothing pins. Only agent-decided disputes, and that
+remainder, reach a person. Measured on a Python `tests` task: of 15 disputes, 2 settled without
+asking, 12 were confirmed as real work, and all 6 the oscillation guard raised were among the 12.
 
 A finding with no snippet is closed by re-running whatever decided it: a spec item against the
 marker set, an `untested-behaviour` finding against the mutation survivor set. Both are
