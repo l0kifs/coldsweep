@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 import pytest
-from conftest import git_init
+from conftest import git_init, owned_rules
 
 from coldsweep.models import MutationConfig, MutationReport, Profile, RawFinding, Scope
 from coldsweep.mutation import (
@@ -160,7 +160,7 @@ def profile(**kw) -> Profile:
     kw.setdefault("test_command", f"{sys.executable} -m pytest -q -x {{tests}}")
     return Profile(
         name="tests", scope=Scope(include=["src/**/*.py"], exclude=["**/__init__.py"]),
-        rules=[], mutation=config(**kw),
+        rules=owned_rules("untested-behaviour"), mutation=config(**kw),
     )
 
 

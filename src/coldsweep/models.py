@@ -473,6 +473,40 @@ class Profile(BaseModel):
         return value
 
     @model_validator(mode="after")
+    def _subsystem_rules_are_owned(self) -> Profile:
+        """Every rule a subsystem emits under must exist and be marked ``decided_by: code``.
+
+        Without this, ``decided_by`` is a second source of truth that nothing reconciles, and a
+        mismatch is silent in three directions at once: the rule is injected into the scan
+        prompt, so agents re-report what a subsystem already answers exhaustively; merge applies
+        its similarity fallback to machine-generated anchors, which is how nine distinct symbols
+        were once absorbed into each other; and the rule lands in the budgeted half of the gate
+        while its decider sits in the other. A rule id no rule declares is worse still -- the
+        subsystem's findings go straight to `unclassified` and hold the gate shut with items no
+        triage can classify.
+        """
+        named = {"mutation.rule_id": self.mutation.rule_id if self.mutation else None}
+        if self.spec:
+            named["spec.unimplemented_rule_id"] = self.spec.unimplemented_rule_id
+            named["spec.stale_reference_rule_id"] = self.spec.stale_reference_rule_id
+        for i, check in enumerate(self.mechanical):
+            named[f"mechanical[{i}].rule_id"] = check.rule_id
+        by_id = {r.id: r for r in self.rules}
+        for where, rule_id in named.items():
+            if rule_id is None:
+                continue
+            rule = by_id.get(rule_id)
+            if rule is None:
+                raise ValueError(
+                    f"{where} names {rule_id!r}, which is not in the profile taxonomy; add the "
+                    f"rule with `decided_by: code`, or its findings land in `unclassified`")
+            if rule.decided_by != "code":
+                raise ValueError(
+                    f"{where} names {rule_id!r}, but that rule is `decided_by: agent`; a rule a "
+                    f"subsystem answers exhaustively must be marked `decided_by: code`")
+        return self
+
+    @model_validator(mode="after")
     def _editable_needs_task_scope(self) -> Profile:
         """A per-file fix phase hands the agent the anchor's own file, which a separate editable
         set is a statement that it must not edit. The two cannot both be meant."""

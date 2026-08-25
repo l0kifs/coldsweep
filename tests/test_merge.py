@@ -369,3 +369,55 @@ def test_exact_identity_still_merges_a_subsystem_rule():
     second, record = merge_round(first, make_round(2, ("s1", ["src/coldsweep/verify.py"], SIBLINGS)),
                                  _exhaustive_profile(), 2)
     assert record.exact == 2 and record.new == 0 and len(second) == 2
+
+
+# --- a decider's silence is proof; an agent's silence is not ---------------
+
+def _owned_profile() -> Profile:
+    return Profile.model_validate({
+        "version": 1, "name": "t",
+        "scope": {"include": ["src/**/*.py"]},
+        "convergence": {"k": 2, "max_rounds": 8},
+        "rules": [
+            {"id": "untested-behaviour", "mode": "presence", "decided_by": "code",
+             "description": "d"},
+            {"id": "vacuous-test", "mode": "absence", "description": "d"},
+        ],
+        "mutation": {"rule_id": "untested-behaviour"},
+    })
+
+
+def _seed(rule: str):
+    scan = make_round(1, ("s1", ["src/a.py"], [{"rule_id": rule, "anchor": "src/a.py::f",
+                                                "evidence": None, "description": "d"}]),
+                      source="mechanical" if rule == "untested-behaviour" else "agent")
+    return merge_round([], scan, _owned_profile(), 1)[0]
+
+
+def _quiet(round_no: int, deterministic: bool):
+    """A round in which the decider ran and reported nothing, or one where it did not run."""
+    shards = [("s1", ["src/a.py"], [])]
+    return make_round(round_no, *shards, source="mechanical" if deterministic else "agent")
+
+
+def test_a_complete_decider_pass_closes_its_finding_as_proof_after_one_round():
+    """The subsystem is exhaustive, so not reporting an anchor is an inspection, not a silence."""
+    findings = _seed("untested-behaviour")
+    findings, record = merge_round(findings, _quiet(2, True), _owned_profile(), 2)
+    assert record.stale_closed == 1 and findings[0].status == "verified"
+    assert "complete pass of its decider" in findings[0].history[-1].detail
+
+
+def test_an_agent_rule_still_lapses_and_still_waits_for_k():
+    findings = _seed("vacuous-test")
+    findings, record = merge_round(findings, _quiet(2, False), _owned_profile(), 2)
+    assert record.stale_closed == 0 and findings[0].status == "open"
+    findings, record = merge_round(findings, _quiet(3, False), _owned_profile(), 3)
+    assert record.stale_closed == 1 and findings[0].status == "lapsed"
+
+
+def test_a_round_where_the_decider_did_not_run_proves_nothing():
+    """Without a pass on the record, absence is not evidence and must not close anything early."""
+    findings = _seed("untested-behaviour")
+    findings, record = merge_round(findings, _quiet(2, False), _owned_profile(), 2)
+    assert record.stale_closed == 0 and findings[0].status == "open"

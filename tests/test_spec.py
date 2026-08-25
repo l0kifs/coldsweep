@@ -9,7 +9,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from conftest import git_init
+from conftest import git_init, owned_rules
 
 from coldsweep.converge import evaluate
 from coldsweep.models import Profile, Scope, SpecConfig, SpecLock
@@ -135,8 +135,11 @@ def project(tmp_path: Path) -> Path:
 
 
 def profile(**kw) -> Profile:
+    cfg = config(**kw)
     return Profile(name="features", scope=Scope(include=["src/**/*.py", "SPEC.md"]),
-                   fix_scope="task", spec=config(**kw))
+                   fix_scope="task", spec=cfg,
+                   rules=owned_rules(*(r for r in (cfg.unimplemented_rule_id,
+                                                   cfg.stale_reference_rule_id) if r)))
 
 
 def test_markers_anchor_to_the_enclosing_symbol(project: Path):
@@ -258,7 +261,8 @@ def test_item_sha_ignores_formatting_only():
 def test_the_spec_document_is_never_handed_to_an_agent_as_a_shard(project: Path):
     """An agent given the spec reports its own items back, under anchors that close never."""
     from coldsweep.shard import build_shards
-    with_spec = Profile(scope=Scope(include=["src/**/*.py", "SPEC.md"]), spec=config())
+    with_spec = Profile(scope=Scope(include=["src/**/*.py", "SPEC.md"]), spec=config(),
+                       rules=owned_rules("unimplemented-spec-item", "stale-spec-reference"))
     without = Profile(scope=Scope(include=["src/**/*.py", "SPEC.md"]))
     assert "SPEC.md" not in [f for s in build_shards(project, with_spec) for f in s.files]
     assert "SPEC.md" in [f for s in build_shards(project, without) for f in s.files]

@@ -142,7 +142,11 @@ stored on a finding, so retiring a rule moves its findings straight back into th
 bucket. A round ingested with `--force` after a shard failed is still a round, but it never
 counts as quiet: half a scan reporting nothing new is not evidence that there is nothing new.
 
-**Closure** — `verified` is proof, `lapsed` is silence. `coldsweep verify` reads the file the
+**Closure** — `verified` is proof, `lapsed` is silence. For a rule a subsystem owns the two
+coincide: one *complete* pass that no longer reports an anchor has inspected the repository, so
+it closes as `verified` after a single round rather than lapsing after K. The pass reports a
+shard even when it finds nothing, precisely so "ran and found nothing" is distinguishable on the
+record from "never ran". `coldsweep verify` reads the file the
 anchor names and confirms the offending snippet is gone; that is `verified`. A finding that K
 consecutive scans simply stopped re-deriving is `lapsed` — closed, but nothing inspected the
 repository to close it. `coldsweep status` counts them separately, so a green run shows how
@@ -403,6 +407,13 @@ rules:
   - id: vacuous-test
     mode: absence         # decided_by: agent is the default
 ```
+
+A rule named by `mutation:`, `spec:` or a `mechanical:` check **must** be in the taxonomy and
+marked `decided_by: code`; the profile is rejected otherwise. Without that check the flag is a
+second source of truth nothing reconciles, and a mismatch is silent in three directions at once:
+agents re-report what a subsystem already answers, merge applies its similarity fallback to
+machine-generated anchors, and the rule lands in the budgeted half of the gate while its decider
+sits in the other.
 
 Rules marked `decided_by: code` never reach the scan prompt. Handing an agent a rule that a
 subsystem already answers exhaustively invites it to report the same item under a different

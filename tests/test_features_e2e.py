@@ -49,9 +49,9 @@ def profile_data(**overrides) -> dict:
         "agent": {"command": [sys.executable, STUB], "append_flags": False,
                   "parallelism": 2, "retries": 1, "timeout_s": 120},
         "rules": [
-            {"id": "unimplemented-spec-item", "mode": "presence",
+            {"id": "unimplemented-spec-item", "mode": "presence", "decided_by": "code",
              "description": "A frozen spec item nothing in scope claims."},
-            {"id": "stale-spec-reference", "mode": "absence",
+            {"id": "stale-spec-reference", "mode": "absence", "decided_by": "code",
              "description": "A marker naming an item that no longer exists."},
         ],
         "mechanical": [],
@@ -146,8 +146,11 @@ def test_implementing_the_item_closes_it(project: Path):
     for n in (2, 3, 4):
         coldsweep(project, "scan")
         coldsweep(project, "ingest", str(paths.run_file(n)))
+    # `verified`, not `lapsed`: the spec sweep is exhaustive over scope, so a complete pass that
+    # no longer reports the item has inspected the repository and found the work done. Closing
+    # this one on silence would have understated evidence-backed closure for the whole profile.
     statuses = {f["rule_id"]: f["status"] for f in read_jsonl(paths.findings)}
-    assert statuses["unimplemented-spec-item"] == "lapsed"
+    assert statuses["unimplemented-spec-item"] == "verified"
     assert coldsweep(project, "converged").returncode == 0
 
 

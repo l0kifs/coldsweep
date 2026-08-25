@@ -394,3 +394,25 @@ undecidable in the other.
 
 Measured (docs/measurements.md, run 3): of 15 disputes, 2 settled without asking, 12 confirmed
 as real work, 1 left to a person because mutation has no opinion about an agent-decided rule.
+
+## 22. Amendment: `decided_by` is derived from the subsystem configs, not asserted beside them
+
+Three defects in a row (10, 11, and the adjudicate gap) were the same error: a rule a subsystem
+owns, handled as though an agent decided it. Each was found by running the tool. The cause is
+that `decided_by` was a second source of truth sitting beside `mutation.rule_id`,
+`spec.unimplemented_rule_id` and `mechanical[].rule_id`, with nothing reconciling them.
+
+A profile is now rejected unless every rule those configs name exists in the taxonomy and is
+marked `decided_by: code`. A mismatch had been silent in three directions at once: the rule
+reached the scan prompt, merge applied its similarity fallback to machine-generated anchors, and
+the gate counted it in the budgeted half. A rule id no rule declares was worse -- the subsystem's
+findings went to `unclassified` and held the gate shut with items triage cannot classify.
+
+Two further sites follow from the same principle:
+
+- **§6, stale closure.** A finding under an owned rule closes as `verified` after one round, not
+  `lapsed` after K. The decider is exhaustive, so a complete pass that stops reporting an anchor
+  is an inspection.
+- **§10, the deterministic pass reports even when clean.** It previously emitted no shard when it
+  found nothing, making "ran and found nothing" identical on the record to "never ran". Stale
+  closure reads that difference, so it has to be recorded.

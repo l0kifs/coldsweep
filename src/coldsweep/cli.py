@@ -347,8 +347,14 @@ def _deterministic_shards(paths: Paths, profile: Profile, shards: list[Shard], r
     pending = [RawFinding(rule_id=f.rule_id, anchor=f.anchor, evidence=f.evidence,
                           description=f.description) for f in findings]
     pending.extend(raws or [])
+    decides = bool(profile.mechanical or profile.mutation or profile.spec)
     if not pending:
-        return []
+        # A clean pass has to leave a trace. Returning nothing makes "the deciders ran and found
+        # nothing" identical on the record to "the deciders never ran", and merge closes findings
+        # on the difference: for a rule a subsystem owns, absence from a *complete* pass is proof,
+        # and absence from no pass at all is nothing.
+        return [ShardResult(shard="deterministic", files=[], ok=True, model="mechanical",
+                            source="mechanical", findings=[])] if decides else []
     files_of = {s.id: s.files for s in shards}
     file_to_shard = {f: s.id for s in shards for f in s.files}
     grouped: dict[str, list[RawFinding]] = {}

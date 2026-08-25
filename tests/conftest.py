@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from coldsweep.models import Profile, RawFinding, ScanRound, ShardResult
+from coldsweep.models import Profile, RawFinding, Rule, ScanRound, ShardResult
 from coldsweep.store import Paths
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -80,3 +80,14 @@ def write_profile(paths: Paths, data: dict) -> None:
 
 def read_jsonl(path: Path) -> list[dict]:
     return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+
+def owned_rules(*rule_ids: str) -> list[Rule]:
+    """Taxonomy entries for the rules a subsystem config names.
+
+    A profile that configures `mutation:` or `spec:` without declaring those rules is rejected,
+    because the subsystem's findings would land in `unclassified`. Fixtures therefore have to
+    declare them, same as a real profile does.
+    """
+    return [Rule(id=r, mode="presence", decided_by="code", description=f"{r} (fixture)")
+            for r in rule_ids]

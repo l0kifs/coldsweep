@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from conftest import owned_rules
 
 from coldsweep.mechanical import CHUNK, MechanicalError, run_all, run_check
 from coldsweep.models import MechanicalCheck, Profile, Scope, Shard
@@ -74,6 +75,7 @@ def test_findings_are_attributed_back_to_their_shard(repo: Path):
     profile = Profile(
         scope=Scope(include=["src/**/*.py"]),
         mechanical=[MechanicalCheck(rule_id="r", command=emitter('[{"anchor": "src/b.py::f"}]'))],
+        rules=owned_rules("r"),
     )
     shards = [Shard(id="s-one", files=["src/a.py"]), Shard(id="s-two", files=["src/b.py"])]
     found = run_all(repo, profile, shards, 1)
@@ -120,6 +122,7 @@ def test_a_finding_outside_every_shard_still_gets_a_home(repo: Path):
     profile = Profile(
         scope=Scope(include=["src/**/*.py"]),
         mechanical=[MechanicalCheck(rule_id="r", command=emitter('[{"anchor": "vendor/x.py::f"}]'))],
+        rules=owned_rules("r"),
     )
     found = run_all(repo, profile, [Shard(id="s-one", files=["src/a.py"])], 1)
     assert [f.shard for f in found] == ["mechanical"]

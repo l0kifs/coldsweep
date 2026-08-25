@@ -196,17 +196,31 @@ def _close_stale(findings: list[Finding], profile: Profile, round_no: int, scan:
 
     Closed as ``lapsed``, never ``verified``: nothing here inspected the repository, so this is
     silence rather than proof, and the two must stay countable apart.
+
+    A rule a subsystem owns is the exception, and closes as ``verified`` after a single round.
+    That subsystem is exhaustive over its scope, so one *complete* pass that does not report an
+    anchor has inspected the repository and found the work done -- proof, not silence, and no
+    reason to wait K rounds for it. "Complete" is read off the round record rather than assumed:
+    the pass reports a shard even when it finds nothing, and without that shard this treats the
+    round as saying nothing at all.
     """
     if not scan.ok:
         return
     k = profile.convergence.k
+    owned = {r for r in (profile.mutation.rule_id if profile.mutation else None,
+                         profile.spec.unimplemented_rule_id if profile.spec else None,
+                         *(c.rule_id for c in profile.mechanical)) if r}
+    decided = any(s.source == "mechanical" and s.ok for s in scan.shards)
     for f in findings:
         if f.status not in ("open", "fixed") or f.last_seen_round >= round_no:
             continue
         if f.first_seen_round >= round_no:
             continue
-        if round_no - f.last_seen_round >= k:
-            f.status = "lapsed"
+        proven = decided and f.rule_id in owned
+        if round_no - f.last_seen_round >= (1 if proven else k):
+            f.status = "verified" if proven else "lapsed"
             f.log(round_no, "close", method="stale",
-                  detail=f"not re-derived in {round_no - f.last_seen_round} consecutive rounds (k={k})")
+                  detail=(f"a complete pass of its decider no longer reports it in round {round_no}"
+                          if proven else
+                          f"not re-derived in {round_no - f.last_seen_round} consecutive rounds (k={k})"))
             record.stale_closed += 1

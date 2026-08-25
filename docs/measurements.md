@@ -788,6 +788,13 @@ without a fix phase and mean nothing.
   purpose: the gate must not open over symbols the decider says nothing pins, and reopening them
   would restart the cycle the oscillation guard exists to stop. What is left for a person is a
   policy call, which is the only part that ever needed one.
+- Three defects in a row were the same error -- a rule a subsystem owns, handled as though an
+  agent decided it -- and all three were found by running the tool rather than by reading it.
+  Auditing the remaining sites deliberately found two more and one root cause: `decided_by` was
+  a second source of truth beside the subsystem configs with nothing reconciling them. Profiles
+  that disagree are now rejected, a finding under an owned rule closes as `verified` after one
+  complete pass instead of lapsing after K, and the deterministic pass reports a shard even when
+  it is clean, because "ran and found nothing" had been indistinguishable from "never ran".
 
 ---
 
