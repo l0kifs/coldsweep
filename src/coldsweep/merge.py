@@ -82,6 +82,7 @@ def merge_round(
     record = RunRecord(round=round_no, failed_shards=scan.failed_shards)
     claimed: set[str] = set()
     taxonomy = profile.rule_ids
+    exhaustive = {r.id for r in profile.rules if r.decided_by == "code"}
 
     for result in sorted(scan.shards, key=lambda s: (s.source, s.shard)):
         if not result.ok:
@@ -89,7 +90,8 @@ def merge_round(
         for raw in result.findings:
             candidate = raw.to_finding(shard=result.shard, round_no=round_no, source=result.source)
             record.ingested += 1
-            _ingest_one(candidate, findings, by_id, claimed, taxonomy, round_no, adjudicator, record)
+            _ingest_one(candidate, findings, by_id, claimed, taxonomy, exhaustive, round_no,
+                        adjudicator, record)
 
     record.unclassified = sum(1 for f in findings
                               if f.rule_id not in taxonomy and f.status != "wontfix")
@@ -103,6 +105,7 @@ def _ingest_one(
     by_id: dict[str, Finding],
     claimed: set[str],
     taxonomy: set[str],
+    exhaustive: set[str],
     round_no: int,
     adjudicator: Adjudicator | None,
     record: RunRecord,
@@ -122,7 +125,18 @@ def _ingest_one(
         record.decisions.append(MergeStat(method="exact", finding_id=hit.id, score=1.0))
         return
 
-    # 3. Similarity fallback, gated to same rule_id and same file.
+    # 3. Similarity fallback, gated to same rule_id and same file -- and never applied to a rule
+    #    a subsystem decides. Such a rule is exhaustive and its anchors are machine-derived, so
+    #    two distinct anchors are two distinct work items by construction; there is no
+    #    differently-phrased duplicate for the fallback to catch. What it catches instead is
+    #    short sibling symbols in one file: measured on this repository, it silently absorbed
+    #    `_python_ranges` into `_tree_ranges` and `_defer` into `_reopen`, because a mutation
+    #    finding's description is a template and rapidfuzz scores the pair above 0.92 on the
+    #    anchor alone. That is loss, which invariant 5 does not permit.
+    if candidate.rule_id in exhaustive:
+        _new_finding(candidate, findings, by_id, record, round_no, unclassified)
+        return
+
     scored = _candidates(candidate, findings, claimed)
     if scored:
         score, best = scored[0]
@@ -159,6 +173,11 @@ def _ingest_one(
 
     # 4. New finding. Also the resting place of the 0.75-0.92 band when no adjudicator is
     #    wired up: an unresolved maybe becomes a duplicate, never a merge.
+    _new_finding(candidate, findings, by_id, record, round_no, unclassified)
+
+
+def _new_finding(candidate: Finding, findings: list[Finding], by_id: dict[str, Finding],
+                 record: RunRecord, round_no: int, unclassified: bool) -> None:
     candidate.log(round_no, "created", method="new",
                   detail="off-taxonomy rule_id" if unclassified else "")
     findings.append(candidate)

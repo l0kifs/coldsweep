@@ -6,7 +6,7 @@ from conftest import load_round, make_round
 
 from coldsweep.converge import is_unclassified
 from coldsweep.merge import ADJUDICATE_FLOOR, AUTO_MERGE, merge_round, similarity
-from coldsweep.models import RawFinding
+from coldsweep.models import Profile, RawFinding
 
 
 def ingest(existing, scan, profile, round_no, adjudicator=None):
@@ -292,3 +292,80 @@ def test_evidence_text_is_backfilled_onto_a_record_that_lacks_it(profile):
     findings, record = ingest(findings, make_round(2, ("s1", ["src/g.py"], [raw])), profile, 2)
     assert record.exact == 1
     assert findings[0].evidence == "except:\npass"
+
+
+# --- a rule a subsystem decides is never fuzzy-matched ----------------------
+
+def _exhaustive_profile() -> Profile:
+    return Profile.model_validate({
+        "version": 1, "name": "t",
+        "scope": {"include": ["src/**/*.py"]},
+        "convergence": {"k": 2, "max_rounds": 8},
+        "rules": [
+            {"id": "untested-behaviour", "mode": "presence", "decided_by": "code",
+             "description": "d"},
+            {"id": "vacuous-test", "mode": "absence", "description": "d"},
+        ],
+    })
+
+
+# Two different functions in one file, as the mutation subsystem reports them: one rule, one
+# file, and a description that is a template, so rapidfuzz scores the pair on the anchor alone.
+SIBLINGS = [
+    {"rule_id": "untested-behaviour", "anchor": "src/coldsweep/verify.py::_defer",
+     "evidence": None,
+     "description": "The test suite passes with the behaviour of this symbol changed "
+                    "('0' -> '1'), so nothing pins it."},
+    {"rule_id": "untested-behaviour", "anchor": "src/coldsweep/verify.py::_reopen",
+     "evidence": None,
+     "description": "The test suite passes with the behaviour of this symbol changed "
+                    "('0' -> '1'), so nothing pins it."},
+]
+
+
+def test_two_symbols_a_subsystem_reports_are_never_merged():
+    """Measured on this repository: the fallback absorbed `_defer` into `_reopen` and 8 more.
+
+    A subsystem is exhaustive and its anchors are machine-derived, so two anchors are two work
+    items -- there is no differently-phrased duplicate to catch, only real items to lose.
+    """
+    findings, record = merge_round([], make_round(1, ("s1", ["src/coldsweep/verify.py"], SIBLINGS)),
+                                   _exhaustive_profile(), 1)
+    assert record.new == 2 and record.fuzzy == 0
+    assert {f.anchor for f in findings} == {s["anchor"] for s in SIBLINGS}
+
+
+def test_the_pair_would_otherwise_score_above_the_auto_merge_threshold():
+    """Without the gate this is a silent deletion, not a near miss."""
+    a, b = (RawFinding.model_validate(s).to_finding("s1", 1) for s in SIBLINGS)
+    assert similarity(a, b) >= AUTO_MERGE
+
+
+def test_no_adjudicator_call_is_made_for_a_subsystem_rule():
+    """29 such calls cost $6.03 in the measured run and merged nothing."""
+    calls = []
+
+    def adjudicator(a, b):
+        calls.append((a.id, b.id))
+        return True
+
+    _, record = merge_round([], make_round(1, ("s1", ["src/coldsweep/verify.py"], SIBLINGS)),
+                            _exhaustive_profile(), 1, adjudicator)
+    assert calls == [] and record.adjudicator_calls == 0
+
+
+def test_an_agent_rule_still_uses_the_fallback():
+    """The gate is per rule, not global: agents really do rephrase the same finding."""
+    pair = [{**s, "rule_id": "vacuous-test"} for s in SIBLINGS]
+    _, record = merge_round([], make_round(1, ("s1", ["src/coldsweep/verify.py"], pair)),
+                            _exhaustive_profile(), 1)
+    assert record.fuzzy == 1 and record.new == 1
+
+
+def test_exact_identity_still_merges_a_subsystem_rule():
+    """Skipping the fallback must not skip step 2 -- a re-derived finding is the same finding."""
+    first, _ = merge_round([], make_round(1, ("s1", ["src/coldsweep/verify.py"], SIBLINGS)),
+                           _exhaustive_profile(), 1)
+    second, record = merge_round(first, make_round(2, ("s1", ["src/coldsweep/verify.py"], SIBLINGS)),
+                                 _exhaustive_profile(), 2)
+    assert record.exact == 2 and record.new == 0 and len(second) == 2
