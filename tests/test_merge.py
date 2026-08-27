@@ -421,3 +421,86 @@ def test_a_round_where_the_decider_did_not_run_proves_nothing():
     findings = _seed("untested-behaviour")
     findings, record = merge_round(findings, _quiet(2, False), _owned_profile(), 2)
     assert record.stale_closed == 0 and findings[0].status == "open"
+
+
+# The two descriptions below are verbatim from two rounds of a real `issues` run over this
+# repository, both naming the unguarded rglob walk in MutationRunner.restore_orphans. Identical
+# rule, identical anchor, different evidence quote -- and they scored 0.748, so before this the
+# pair fell through to `new` and one defect was carried as two findings for the gate to count.
+_SAME_SYMBOL_TWICE = (
+    "the repo-wide filesystem traversal is not wrapped in error handling, unlike every other "
+    "filesystem access in this file, so an I/O or permission error while walking the tree "
+    "surfaces as an unhandled exception.",
+    "The directory walk via self.repo.rglob(...) is not wrapped in error handling, so an "
+    "OSError raised while traversing the tree (e.g. a permission-denied subdirectory) "
+    "propagates as a raw exception instead of the MutationError every other filesystem "
+    "operation in this class produces.",
+)
+_ANCHOR = "src/coldsweep/mutation.py::MutationRunner::restore_orphans"
+
+
+def _reworded_rounds():
+    first, second = (
+        make_round(n, ("s1", ["src/coldsweep/mutation.py"], [
+            {"rule_id": "missing-error-handling", "anchor": _ANCHOR, "evidence": ev,
+             "description": desc},
+        ]))
+        for n, (desc, ev) in enumerate(
+            zip(_SAME_SYMBOL_TWICE,
+                ['for backup in sorted(self.repo.rglob(f"*{BACKUP_SUFFIX}")):',
+                 'restored = []\nfailures: list[str] = []\nfor backup in sorted('],
+                strict=True),
+            start=1)
+    )
+    return first, second
+
+
+def test_same_anchor_reaches_the_adjudicator_below_the_floor(profile):
+    first, second = _reworded_rounds()
+    existing, _ = ingest([], first, profile, 1)
+    candidate = second.shards[0].findings[0].to_finding("s1", 2)
+    assert similarity(candidate, existing[0]) < ADJUDICATE_FLOOR, "the pair is under the floor on wording"
+
+    merged, record = ingest(existing, second, profile, 2, adjudicator=lambda a, b: True)
+    assert record.adjudicator_calls == 1, "an identical anchor is judged, whatever the wording scores"
+    assert record.adjudicated == 1 and record.new == 0
+    assert len(merged) == 1 and merged[0].last_seen_round == 2
+
+
+def test_same_anchor_without_an_adjudicator_still_duplicates(profile):
+    first, second = _reworded_rounds()
+    existing, _ = ingest([], first, profile, 1)
+    merged, record = ingest(existing, second, profile, 2)
+    assert record.new == 1 and len(merged) == 2, "--no-llm resolves an unjudged maybe as a duplicate"
+
+
+def test_same_anchor_ruled_different_stays_two_findings(profile):
+    first, second = _reworded_rounds()
+    existing, _ = ingest([], first, profile, 1)
+    merged, record = ingest(existing, second, profile, 2, adjudicator=lambda a, b: False)
+    assert record.adjudicator_calls == 1 and record.adjudicated == 0
+    assert record.new == 1 and len(merged) == 2, "escalating is asking, never merging"
+
+
+def test_an_identical_anchor_outranks_a_better_scoring_sibling(profile):
+    first = make_round(1,
+        ("s1", ["src/g.py"], [
+            {"rule_id": "missing-error-handling", "anchor": "src/g.py::send",
+             "evidence": "x = 1", "description": "The outbound call is unguarded."},
+            {"rule_id": "missing-error-handling", "anchor": "src/g.py::sends",
+             "evidence": "x = 2", "description": "The call is unguarded against transport failure."},
+        ]))
+    existing, _ = ingest([], first, profile, 1)
+    second = make_round(2, ("s1", ["src/g.py"], [
+        {"rule_id": "missing-error-handling", "anchor": "src/g.py::send",
+         "evidence": "x = 3", "description": "The call is unguarded against transport failure."},
+    ]))
+    candidate = second.shards[0].findings[0].to_finding("s1", 2)
+    assert similarity(candidate, existing[1]) >= AUTO_MERGE, "the sibling would have auto-merged"
+    assert similarity(candidate, existing[0]) < AUTO_MERGE, "its own symbol scores lower, on wording alone"
+
+    judged = []
+    merged, _ = ingest(existing, second, profile, 2,
+                       adjudicator=lambda a, b: judged.append(b.anchor) or True)
+    assert judged == ["src/g.py::send"], "the candidate's own symbol is what gets judged"
+    assert len(merged) == 2

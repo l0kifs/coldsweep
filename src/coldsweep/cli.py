@@ -503,7 +503,8 @@ def ingest(
     repo: Annotated[Path | None, _repo_opt()] = None,
     force: Annotated[bool, typer.Option("--force", help="Ingest even though shards failed.")] = False,
     no_llm: Annotated[bool, typer.Option(
-        "--no-llm", help="Never adjudicate; the 0.75-0.92 band becomes a new finding.")] = False,
+        "--no-llm", help="Never adjudicate; the 0.75-0.92 band and same-anchor pairs "
+                          "become new findings.")] = False,
 ) -> None:
     """Validate, merge and update findings.jsonl."""
     paths, profile, findings = _load(repo, task)

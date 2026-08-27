@@ -50,6 +50,25 @@ def _candidates(incoming: Finding, existing: list[Finding], claimed: set[str]) -
     return scored
 
 
+def _pair_to_judge(incoming: Finding, scored: list[tuple[float, Finding]]) -> tuple[float, Finding]:
+    """The finding this candidate is weighed against: an identical anchor first, else the score.
+
+    ``similarity`` weights anchor and description equally, so the same symbol described in two
+    different sentences can fall under the floor and become a second finding for one defect --
+    measured on this repository at 0.748 against a floor of 0.75, two thousandths short. An
+    anchor is a symbol path, so equality here is exact rather than fuzzy: same rule, same file,
+    same symbol. That pair gets judged on what it is, not on how the two rounds worded it.
+
+    Preferring it over a higher-scoring *different* anchor also narrows the failure the module
+    docstring names: a sibling symbol scoring above ``AUTO_MERGE`` no longer wins against the
+    symbol the candidate actually names.
+    """
+    for pair in scored:
+        if pair[1].anchor == incoming.anchor:
+            return pair
+    return scored[0]
+
+
 def _touch(target: Finding, round_no: int, method: str, score: float | None, detail: str,
            record: RunRecord) -> None:
     """Register that this round re-derived an existing finding, applying reopen semantics."""
@@ -147,7 +166,7 @@ def _ingest_one(
 
     scored = _candidates(candidate, findings, claimed)
     if scored:
-        score, best = scored[0]
+        score, best = _pair_to_judge(candidate, scored)
         if score >= AUTO_MERGE:
             claimed.add(best.id)
             _touch(best, round_no, "fuzzy", score, f"auto-merged {candidate.id}", record)
@@ -156,7 +175,9 @@ def _ingest_one(
             record.decisions.append(MergeStat(method="fuzzy", finding_id=best.id, score=score,
                                               detail=f"absorbed {candidate.id}"))
             return
-        if score >= ADJUDICATE_FLOOR and adjudicator is not None:
+        # An identical anchor is escalated whatever it scores: the score measures phrasing,
+        # and phrasing is the one thing two rounds are free to differ on.
+        if (score >= ADJUDICATE_FLOOR or best.anchor == candidate.anchor) and adjudicator is not None:
             record.adjudicator_calls += 1
             try:
                 same = bool(adjudicator(candidate, best))
