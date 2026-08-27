@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 from conftest import TASK, read_jsonl
 
+from coldsweep import store as store_module
 from coldsweep.models import Profile, RawFinding, Rule, RunRecord, ScanRound, ShardResult
 from coldsweep.store import (
     Paths,
@@ -22,6 +23,7 @@ from coldsweep.store import (
     load_round,
     next_round,
     rebuild_index,
+    reserve_task,
     save_findings,
     save_profile,
     save_round,
@@ -271,3 +273,33 @@ def test_a_run_record_is_written_with_sorted_keys(paths: Paths):
     save_run_record(paths, RunRecord(round=1, new=1))
     text = paths.ingest_file(1).read_text()
     assert text.index('"adjudicated"') < text.index('"round"') < text.index('"unclassified"')
+
+
+def test_every_reserved_task_gets_its_own_directory(repo: Path):
+    claimed = [reserve_task(repo, "harden-io") for _ in range(50)]
+    assert len({p.task for p in claimed}) == 50
+    assert all(p.task.startswith("harden-io-") and p.root.is_dir() for p in claimed)
+    assert sorted(entry.name for entry in (repo / ".coldsweep" / "tasks").iterdir()) == \
+        sorted(p.task for p in claimed)
+
+
+def test_a_repeated_suffix_loses_the_directory_rather_than_sharing_it(repo: Path, monkeypatch):
+    """The guarantee is the exclusive mkdir, not the odds. Force the collision and check."""
+    tokens = iter(["aaaaaaaa", "aaaaaaaa", "bbbbbbbb"])
+    monkeypatch.setattr(store_module.secrets, "token_hex", lambda _n: next(tokens))
+    first = reserve_task(repo, "t")
+    second = reserve_task(repo, "t")
+    assert (first.task, second.task) == ("t-aaaaaaaa", "t-bbbbbbbb")
+
+
+def test_a_task_name_too_long_to_carry_a_suffix_is_refused(repo: Path):
+    reserve_task(repo, "a" * 55)
+    with pytest.raises(StoreError, match="at most 55 characters"):
+        reserve_task(repo, "a" * 56)
+
+
+def test_reserving_gives_up_rather_than_looping_forever(repo: Path, monkeypatch):
+    monkeypatch.setattr(store_module.secrets, "token_hex", lambda _n: "cccccccc")
+    reserve_task(repo, "t")
+    with pytest.raises(StoreError, match="could not claim"):
+        reserve_task(repo, "t")

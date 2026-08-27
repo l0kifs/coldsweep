@@ -12,7 +12,7 @@ import pytest
 import yaml
 from conftest import git_init, read_jsonl
 
-from coldsweep.store import Paths
+from coldsweep.store import Paths, list_tasks
 
 pytestmark = pytest.mark.e2e
 
@@ -92,7 +92,7 @@ def init(project: Path, **kw) -> Paths:
 
 def test_the_features_template_scaffolds_and_reports(project: Path):
     assert coldsweep(project, "init", "features").returncode == 0
-    result = coldsweep(project, "spec", "status")
+    result = coldsweep(project, "spec", "status", task=list_tasks(project)[0])
     assert result.returncode == 0 and "NOT FROZEN" in result.stdout
     assert "the loop never validates the spec itself" in result.stdout
 

@@ -129,21 +129,26 @@ def init(
     template: Annotated[str, typer.Argument(
         help="Profile template: issues, docs, or a path to a YAML file.")] = "issues",
     repo: Annotated[Path | None, _repo_opt()] = None,
-    force: Annotated[bool, typer.Option("--force", help="Overwrite this task's profile.")] = False,
+    force: Annotated[bool, typer.Option(
+        "--force", help="Use --task verbatim as the id, overwriting that task's profile.")] = False,
 ) -> None:
-    """Create a task: scaffold .coldsweep/tasks/<task>/ from a profile template."""
+    """Create a task: scaffold .coldsweep/tasks/<task>-<id>/ from a profile template.
+
+    ``--task`` names the task; the id is generated. Two people, or two shells, can create
+    `harden-io` at the same moment and get two tasks instead of one write over the other.
+    """
     root = (repo or Path.cwd()).resolve()
-    try:
-        paths = Paths(root, task)
-    except StoreError as exc:
-        _fail(str(exc))
-        return
+    # Resolved before the directory is claimed: a bad template must not leave an empty task
+    # behind for `task list` to report.
     source = Path(template) if template.endswith((".yaml", ".yml")) else TEMPLATE_DIR / f"{template}.yaml"
     if not source.is_file():
         available = ", ".join(sorted(p.stem for p in TEMPLATE_DIR.glob("*.yaml")))
         _fail(f"no such profile template: {template} (available: {available})")
-    if paths.profile.exists() and not force:
-        _fail(f"task {task!r} already exists at {paths.root}; pass --force to overwrite its profile")
+    try:
+        paths = Paths(root, task) if force else store.reserve_task(root, task)
+    except StoreError as exc:
+        _fail(str(exc))
+        return
 
     try:
         paths.runs.mkdir(parents=True, exist_ok=True)
@@ -154,21 +159,21 @@ def init(
         (paths.container / ".gitignore").write_text(
             "tasks/*/index.sqlite\ntasks/*/mutants.sqlite\ntasks/*/mutants.lock\n", encoding="utf-8")
     except OSError as exc:
-        _fail(f"could not scaffold task {task!r}: {exc}")
+        _fail(f"could not scaffold task {paths.task!r}: {exc}")
         return
     store.load_profile(paths)
 
     created = store.load_profile(paths)
-    typer.echo(f"created task {task!r} at {paths.root} from {source.name}")
+    typer.echo(f"created task {paths.task!r} at {paths.root} from {source.name}")
     if created.budget_bounded:
         typer.secho("  every rule here is decided by an agent, so this task is budget-bounded: "
                     "nothing in it forces the gate to close.\n"
                     f"  run it to max_rounds={created.convergence.max_rounds} and read "
-                    f"`coldsweep status --task {task}`. Converging is possible here, never "
+                    f"`coldsweep status --task {paths.task}`. Converging is possible here, never "
                     f"promised.", fg=typer.colors.YELLOW)
     typer.echo("  committed: profile.yaml, findings.jsonl, runs/    gitignored: index.sqlite")
-    typer.echo(f"  edit {paths.profile} to state the task, then: coldsweep run --task {task}")
-    siblings = [t for t in store.list_tasks(paths.repo) if t != task]
+    typer.echo(f"  edit {paths.profile} to state the task, then: coldsweep run --task {paths.task}")
+    siblings = [t for t in store.list_tasks(paths.repo) if t != paths.task]
     if siblings:
         typer.echo(f"  other tasks in this repo: {', '.join(siblings)}")
 

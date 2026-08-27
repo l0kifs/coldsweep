@@ -93,21 +93,48 @@ def init(project: Path, task: str = TASK, **kw) -> Paths:
     return paths
 
 
+def only_task(project: Path) -> str:
+    """The one task in a scratch repo. `init` generates the id, so tests read it back."""
+    names = store.list_tasks(project)
+    assert len(names) == 1, names
+    return names[0]
+
+
 def test_init_scaffolds_a_working_task(project: Path):
     result = coldsweep(project, "init", "issues")
     assert result.returncode == 0, result.stderr
-    paths = Paths(project, TASK)
-    assert paths.root == project / ".coldsweep" / "tasks" / TASK
+    task = only_task(project)
+    assert task.startswith(f"{TASK}-"), "the name is the base; the id carries a suffix"
+    assert task in result.stdout, "the id is printed, because nothing else can guess it"
+    paths = Paths(project, task)
+    assert paths.root == project / ".coldsweep" / "tasks" / task
     assert paths.profile.is_file() and paths.findings.is_file() and paths.runs.is_dir()
     assert (paths.container / ".gitignore").read_text().split() == [
         "tasks/*/index.sqlite", "tasks/*/mutants.sqlite", "tasks/*/mutants.lock"]
-    assert coldsweep(project, "shard").returncode == 0
+    assert coldsweep(project, "shard", task=task).returncode == 0
 
 
-def test_init_refuses_to_clobber_an_existing_task(project: Path):
-    coldsweep(project, "init", "issues")
-    assert coldsweep(project, "init", "docs").returncode == 2
+def test_two_inits_under_one_name_are_two_tasks(project: Path):
+    assert coldsweep(project, "init", "issues").returncode == 0
+    assert coldsweep(project, "init", "docs").returncode == 0
+    names = store.list_tasks(project)
+    assert len(set(names)) == 2, "the second init cannot land on the first task"
+    assert all(n.startswith(f"{TASK}-") for n in names)
+
+
+def test_force_takes_the_task_name_as_the_id_verbatim(project: Path):
+    assert coldsweep(project, "init", "issues", "--force").returncode == 0
+    assert store.list_tasks(project) == [TASK], "--force generates no suffix"
     assert coldsweep(project, "init", "docs", "--force").returncode == 0
+    assert yaml.safe_load(Paths(project, TASK).profile.read_text())["name"] == "docs"
+    assert store.list_tasks(project) == [TASK], "and overwrites in place"
+
+
+def test_a_base_name_is_not_a_task_id(project: Path):
+    coldsweep(project, "init", "issues")
+    result = coldsweep(project, "status", task=TASK)
+    assert result.returncode == 2
+    assert "did you mean" in result.stderr and only_task(project) in result.stderr
 
 
 def test_shard_lists_one_file_per_shard(project: Path):

@@ -29,12 +29,12 @@ uv add "coldsweep[languages]"
 
 ```sh
 cd /path/to/target-repo
-coldsweep init issues --task harden-io   # create a task from a profile template
-$EDITOR .coldsweep/tasks/harden-io/profile.yaml   # the rule taxonomy IS the task statement
-coldsweep shard      --task harden-io    # check what the scope actually resolves to
-coldsweep run        --task harden-io    # scan -> ingest -> fix -> verify, until converged
-coldsweep status     --task harden-io    # counts, unclassified bucket, pending disputes
-coldsweep converged  --task harden-io; echo $?    # 0 or 1, prints nothing -- the gate
+coldsweep init issues --task harden-io   # prints the id: harden-io-003de0e8
+$EDITOR .coldsweep/tasks/harden-io-003de0e8/profile.yaml   # the rule taxonomy IS the task statement
+coldsweep shard      --task harden-io-003de0e8    # check what the scope actually resolves to
+coldsweep run        --task harden-io-003de0e8    # scan -> ingest -> fix -> verify, until converged
+coldsweep status     --task harden-io-003de0e8    # counts, unclassified bucket, pending disputes
+coldsweep converged  --task harden-io-003de0e8; echo $?    # 0 or 1, prints nothing -- the gate
 ```
 
 `coldsweep run` exits non-zero when it cannot converge, and says why.
@@ -57,10 +57,17 @@ Work is organised into named tasks, each with its own taxonomy, finding set and 
 history. Running a second task over the same repository is just another task:
 
 ```sh
-coldsweep init docs --task document-api
-coldsweep run       --task document-api
+coldsweep init docs --task document-api      # -> document-api-9f41c7b2
+coldsweep run       --task document-api-9f41c7b2
 coldsweep task list
 ```
+
+`init` names the directory `<name>-<id>` and prints it; every other command wants that id, not
+the name you typed. The id is what makes two `init` calls two tasks: creating the directory is
+how a task is claimed, and `mkdir` admits one winner, so two shells racing on `harden-io` cannot
+end up writing into one task. Nothing resolves a name to an id -- `coldsweep task list` prints
+them, and a command given a bare name says which ids that name has. `--force` opts out entirely
+and takes `--task` as the id verbatim, overwriting whatever is there.
 
 **There is no default task.** Every command that touches state requires `--task` (or
 `COLDSWEEP_TASK` in the environment) and fails loudly without it. A task inherits nothing from any
@@ -71,7 +78,7 @@ a previous task's history.
 
 | Command | Does |
 |---|---|
-| `coldsweep init <template> --task <t>` | Create a task from `issues`, `docs`, `tests`, `features`, or a YAML path |
+| `coldsweep init <template> --task <t>` | Create a task from `issues`, `docs`, `tests`, `features`, or a YAML path; prints its generated id |
 | `coldsweep task list` | Every task, its round count and whether its gate is open |
 | `coldsweep shard` | Print the resolved shard list |
 | `coldsweep scan [--round N]` | Mechanical checks plus one full agent scan; writes `runs/<N>.json` |
@@ -97,14 +104,14 @@ Lives in the target repo, not here, and is scoped per task:
 .coldsweep/
   .gitignore                     # ignores tasks/*/index.sqlite
   tasks/
-    harden-io/
+    harden-io-003de0e8/          # <name>-<generated id>, so two inits never collide
       profile.yaml               # committed -- the taxonomy is the task statement
       findings.jsonl             # committed -- source of truth, one finding per line, by id
       spend.jsonl                # committed -- one line per agent subprocess, and what it cost
       runs/<round>.json          # committed -- raw scan output
       runs/<round>.ingest.json   # committed -- merge audit record
       index.sqlite               # gitignored -- derived, rebuildable at any time
-    document-api/
+    document-api-9f41c7b2/
       ...
 ```
 
@@ -457,7 +464,7 @@ Adjudication is counted by calls made, not merges produced. A pair the adjudicat
 that spent 85 of them used to report `adjudicated 0`.
 
 ```
-$ coldsweep status --task harden-io
+$ coldsweep status --task harden-io-003de0e8
 spend over 102 agent call(s)
   cost       $44.99
   tokens     26,878,672  (in 1,151  out 742,423  cache write 4,535,822  read 21,599,276)
@@ -481,7 +488,7 @@ its own:
 
 ```json
 {"hooks": {"Stop": [{"hooks": [
-    {"type": "command", "command": "coldsweep-stop-hook --task harden-io"}]}]}}
+    {"type": "command", "command": "coldsweep-stop-hook --task harden-io-003de0e8"}]}]}}
 ```
 
 It names its task like every other entry point; a hook that guessed would be the same stale

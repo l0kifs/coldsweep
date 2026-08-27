@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import secrets
 import sqlite3
 import sys
 import tempfile
@@ -19,6 +20,12 @@ from .models import Finding, Profile, Rule, RunRecord, ScanRound, SpendRecord
 COLDSWEEP_DIR = ".coldsweep"
 TASKS_DIR = "tasks"
 TASK_NAME = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+# A task id is a base name plus a generated suffix. The base is bounded so the id it becomes
+# still fits TASK_NAME: 64 minus the nine characters of "-xxxxxxxx".
+TASK_BASE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,54}$")
+TASK_SUFFIX_BYTES = 4
+RESERVE_ATTEMPTS = 8
+NEAR_LIMIT = 8
 _RULES_BLOCK = re.compile(r"^rules:[ \t]*$", re.MULTILINE)
 
 
@@ -34,6 +41,38 @@ def validate_task(name: str) -> str:
             "starting with a letter or digit, at most 64 characters"
         )
     return name
+
+
+def validate_task_base(name: str) -> str:
+    """The half of a task id the caller chooses. Checked before a suffix is appended to it."""
+    if not TASK_BASE.match(name or ""):
+        raise StoreError(
+            f"invalid task name {name!r}: use lowercase letters, digits, '.', '_' or '-', "
+            "starting with a letter or digit, at most 55 characters"
+        )
+    return name
+
+
+def reserve_task(repo: Path, base: str) -> Paths:
+    """Claim a task directory named ``<base>-<8 hex>``, and return the paths that address it.
+
+    Creating the directory *is* the claim. Two `init` calls racing on the same base name are
+    two tasks rather than one corrupted one, and that holds for a reason stronger than the
+    suffix being unlikely to repeat: ``mkdir`` without ``exist_ok`` is exclusive, so exactly
+    one process can win a given id and the loser draws again.
+    """
+    base = validate_task_base(base)
+    for _ in range(RESERVE_ATTEMPTS):
+        paths = Paths(repo, f"{base}-{secrets.token_hex(TASK_SUFFIX_BYTES)}")
+        try:
+            paths.root.mkdir(parents=True, exist_ok=False)
+        except FileExistsError:
+            continue
+        except OSError as exc:
+            raise StoreError(f"cannot create {paths.root}: {exc}") from exc
+        return paths
+    raise StoreError(
+        f"could not claim a task directory for {base!r} after {RESERVE_ATTEMPTS} attempts")
 
 
 class Paths:
@@ -139,11 +178,21 @@ def atomic_write(path: Path, data: str) -> None:
 def load_profile(paths: Paths) -> Profile:
     if not paths.profile.is_file():
         known = list_tasks(paths.repo)
-        hint = f"existing tasks: {', '.join(known)}" if known else "no tasks exist yet"
+        # A task id carries a generated suffix, so the likeliest mistake is naming the base
+        # instead of the id. Say which ids that base has, rather than the whole list.
+        near = [t for t in known if t.startswith(f"{paths.task}-")]
+        if near:
+            shown, rest = near[:NEAR_LIMIT], len(near) - NEAR_LIMIT
+            hint = f"did you mean: {', '.join(shown)}"
+            if rest > 0:
+                hint += f", and {rest} more -- `coldsweep task list`"
+        else:
+            hint = f"existing tasks: {', '.join(known)}" if known else "no tasks exist yet"
         raise StoreError(
             f"task {paths.task!r} has no profile at {paths.profile}\n"
             f"  {hint}\n"
-            f"  create it with: coldsweep init <template> --task {paths.task}"
+            f"  create one with: coldsweep init <template> --task {paths.task}\n"
+            f"  init appends a unique suffix -- act on the task id it prints"
         )
     try:
         text = paths.profile.read_text(encoding="utf-8")
