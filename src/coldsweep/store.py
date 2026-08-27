@@ -349,7 +349,10 @@ def next_round(paths: Paths) -> int:
     done = completed_rounds(paths)
     scanned = []
     if paths.runs.is_dir():
-        scanned = [int(p.stem) for p in paths.runs.glob("*.json") if p.stem.isdigit()]
+        try:
+            scanned = [int(p.stem) for p in paths.runs.glob("*.json") if p.stem.isdigit()]
+        except OSError as exc:
+            raise StoreError(f"cannot list {paths.runs}: {exc}") from exc
     return max([*done, *scanned, 0]) + 1
 
 

@@ -397,9 +397,12 @@ class MutationCache:
         return None if row is None else (bool(row[0]), row[1])
 
     def put_probe(self, kind: str, key: tuple[str, str, str, str], ok: bool, detail: str) -> None:
-        self.con.execute("INSERT OR REPLACE INTO probes VALUES (?,?,?,?,?,?,?)",
-                         (kind, *key, int(ok), detail))
-        self.con.commit()
+        try:
+            self.con.execute("INSERT OR REPLACE INTO probes VALUES (?,?,?,?,?,?,?)",
+                             (kind, *key, int(ok), detail))
+            self.con.commit()
+        except sqlite3.Error as exc:
+            raise MutationError(f"cannot write mutation probe to cache: {exc}") from exc
 
     def put(self, key: tuple[str, str, str, str], result: MutantResult) -> None:
         try:
@@ -514,7 +517,11 @@ class MutationRunner:
         """
         restored = []
         failures: list[str] = []
-        for backup in sorted(self.repo.rglob(f"*{BACKUP_SUFFIX}")):
+        try:
+            backups = sorted(self.repo.rglob(f"*{BACKUP_SUFFIX}"))
+        except OSError as exc:
+            raise MutationError(f"cannot sweep {self.repo} for orphaned mutant backups: {exc}") from exc
+        for backup in backups:
             target = backup.with_name(backup.name[: -len(BACKUP_SUFFIX)])
             try:
                 shutil.move(str(backup), str(target))

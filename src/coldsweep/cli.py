@@ -1061,7 +1061,7 @@ def _summary(paths: Paths) -> None:
 def main() -> None:
     try:
         app()
-    except (StoreError, ShardError, AgentError) as exc:
+    except (StoreError, ShardError, AgentError, merge.MergeError) as exc:
         typer.secho(f"error: {exc}", fg=typer.colors.RED, err=True)
         sys.exit(2)
 

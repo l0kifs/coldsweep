@@ -150,8 +150,8 @@ def paired_tests(repo: Path, source: str, patterns: list[str]) -> list[str]:
         try:
             if (repo / c).is_file():
                 out.append(c)
-        except OSError:
-            continue
+        except OSError as exc:
+            raise ShardError(f"cannot check whether {c} exists: {exc}") from exc
     return out
 
 

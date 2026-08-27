@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
+from pydantic import ValidationError
 from rapidfuzz import fuzz
 
 from .models import Finding, MergeStat, Profile, RunRecord, ScanRound
@@ -88,7 +89,14 @@ def merge_round(
         if not result.ok:
             continue
         for raw in result.findings:
-            candidate = raw.to_finding(shard=result.shard, round_no=round_no, source=result.source)
+            try:
+                candidate = raw.to_finding(shard=result.shard, round_no=round_no, source=result.source)
+            except ValidationError as exc:
+                # RawFinding accepts an anchor Finding rejects (a line reference), so the
+                # conversion is the first place a bad anchor is caught. Name the shard: the
+                # scan output is the thing to re-run.
+                raise MergeError(f"round {round_no}, shard {result.shard}: rule {raw.rule_id!r} "
+                                 f"reported an unusable anchor {raw.anchor!r}: {exc}") from exc
             record.ingested += 1
             _ingest_one(candidate, findings, by_id, claimed, taxonomy, exhaustive, round_no,
                         adjudicator, record)
